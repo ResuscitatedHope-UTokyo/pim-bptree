@@ -6,7 +6,7 @@ extern "C" {
 #include "common.h"
 }
 
-#define N 1000
+#define N 1000000
 
 uint64_t n = N;
 kvpair_t query_buffer[N];

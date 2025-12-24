@@ -13,7 +13,7 @@ __mram_noinit_keep kvpair_t query_buffer[MAX_QUERIES];
 __mram_ptr uint8_t *mram_free = __sys_used_mram_end;
 // --- DPU B+ Tree Implementation ---
 
-#define MAX_KEYS 3
+#define MAX_KEYS 30
 
 typedef int KeyType;
 typedef int ValueType;
@@ -70,7 +70,7 @@ __mram_ptr LeafNode* create_leaf_node(void) {
     node.prev = NULL;
     
     __mram_ptr LeafNode *mram_node = (__mram_ptr LeafNode *)mram_alloc(sizeof(LeafNode));
-    mram_write(&node, mram_node, sizeof(LeafNode));
+    // mram_write(&node, mram_node, sizeof(LeafNode));
     return mram_node;
 }
 
@@ -80,12 +80,12 @@ __mram_ptr InternalNode* create_internal_node(void) {
     node.num_keys = 0;
 
     __mram_ptr InternalNode *mram_node = (__mram_ptr InternalNode *)mram_alloc(sizeof(InternalNode));
-    mram_write(&node, mram_node, sizeof(InternalNode));
+    // mram_write(&node, mram_node, sizeof(InternalNode));
     return mram_node;
 }
 
 static void split_leaf_node(__mram_ptr LeafNode *leaf_addr, LeafNode *leaf_wram, KeyType key, ValueType value, KeyType *split_key, __mram_ptr LeafNode **new_leaf_out) {
-    printf("!!! Splitting Leaf Node !!!\n");
+    // printf("!!! Splitting Leaf Node !!!\n");
     LeafNode new_leaf_wram __dma_aligned;
     __mram_ptr LeafNode *new_leaf_addr = create_leaf_node();
 
@@ -142,7 +142,7 @@ static void split_leaf_node(__mram_ptr LeafNode *leaf_addr, LeafNode *leaf_wram,
 }
 
 static void split_internal_node(__mram_ptr InternalNode *node_addr, InternalNode *node_wram, KeyType key, __mram_ptr void *child, KeyType *up_key, __mram_ptr InternalNode **new_node_out) {
-    printf("!!! Splitting Internal Node !!!\n");
+    // printf("!!! Splitting Internal Node !!!\n");
     InternalNode new_node_wram __dma_aligned;
     __mram_ptr InternalNode *new_node_addr = create_internal_node();
     
@@ -355,18 +355,13 @@ void print_tree_structure() {
 int main()
 {
   if (me() == 0) {
-    int limit = 15;
-    if (limit > nr_queries) limit = nr_queries;
-
-    printf("Initial Tree:\n");
-    print_tree_structure();
-
+    for (int i = 0; i < 500000; i++) {
+      bptree_insert(query_buffer[i].key, query_buffer[i].value);
+    }
     const perfcounter_t before_time = perfcounter_config(COUNT_CYCLES, false);
     // start insertion
-    for (int i = 0; i < limit; i++) {
-      printf("\n>>> Inserting Key: %d\n", query_buffer[i].key);
+    for (int i = 500000; i < 500000 + 2500; i++) {
       bptree_insert(query_buffer[i].key, query_buffer[i].value);
-      print_tree_structure();
     }
     // end insertion
     const perfcounter_t run_clocks = perfcounter_get() - before_time;
