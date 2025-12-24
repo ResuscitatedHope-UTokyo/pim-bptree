@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <perfcounter.h>
 #include <defs.h>
 #include <mram.h>
 #include "../common.h"
@@ -360,11 +361,16 @@ int main()
     printf("Initial Tree:\n");
     print_tree_structure();
 
+    const perfcounter_t before_time = perfcounter_config(COUNT_CYCLES, false);
+    // start insertion
     for (int i = 0; i < limit; i++) {
       printf("\n>>> Inserting Key: %d\n", query_buffer[i].key);
       bptree_insert(query_buffer[i].key, query_buffer[i].value);
       print_tree_structure();
     }
+    // end insertion
+    const perfcounter_t run_clocks = perfcounter_get() - before_time;
+    printf("Elapsed time: %f sec\n", (float)run_clocks / (float)CLOCKS_PER_SEC);
   }
   return 0;
 }
