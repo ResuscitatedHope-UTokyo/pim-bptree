@@ -2,10 +2,10 @@ HOST_CXX      = clang++
 HOST_TARGET   = host
 
 DPU_CC        = dpu-upmem-dpurte-clang
-DPU_TARGET    = list.dpu
+DPU_TARGET    = B+Tree.dpu
 
 HOST_SRC      := host.cpp
-DPU_SRC       := dpu/list.c
+DPU_SRC       := dpu/B+Tree.c
 
 HOST_CXXFLAGS += -O2 -std=c++17 $(shell dpu-pkg-config --cflags dpu)
 HOST_LDFLAGS  += $(shell dpu-pkg-config --libs dpu)
