@@ -1,5 +1,8 @@
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <vector>
+
 extern "C" {
 #include <dpu.h>
 #include <dpu_log.h>
@@ -11,6 +14,10 @@ extern "C" {
 uint64_t n = N;
 kvpair_t query_buffer[N];
 
+bool compareKvPairs(const kvpair_t &a, const kvpair_t &b) {
+    return a.key < b.key;
+}
+
 void make_query()
 {
   int seed = 74755;
@@ -19,6 +26,8 @@ void make_query()
     query_buffer[i].value = i;
     seed = (seed * 1309 + 13849) & 65535;
   }
+
+  std::sort(query_buffer, query_buffer + N, compareKvPairs);
 }
 
 int main(int argc, char* argv[])
@@ -39,11 +48,11 @@ int main(int argc, char* argv[])
 
     
     DPU_ASSERT(dpu_broadcast_to(set, "nr_queries", 0,
-				&n, sizeof(uint64_t),
-				DPU_XFER_DEFAULT));
+&n, sizeof(uint64_t),
+DPU_XFER_DEFAULT));
     DPU_ASSERT(dpu_broadcast_to(set, "query_buffer", 0,
-				query_buffer, sizeof(kvpair_t) * n,
-				DPU_XFER_DEFAULT));
+query_buffer, sizeof(kvpair_t) * n,
+DPU_XFER_DEFAULT));
 
     DPU_ASSERT(dpu_launch(set, DPU_SYNCHRONOUS));
     DPU_FOREACH(set, dpu)
