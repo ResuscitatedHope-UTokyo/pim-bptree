@@ -20,7 +20,7 @@ BARRIER_INIT(init_barrier, NR_TASKLETS);
 #define MAX_KEYS 30
 #define MAX_SUBTREES 32
 #define MAX_TOTAL_ROOTS (NR_TASKLETS * MAX_SUBTREES)
-#define BATCH_SIZE 32
+#define BATCH_SIZE 16
 typedef int KeyType;
 typedef int ValueType;
 typedef enum { LEAF_NODE, INTERNAL_NODE } NodeType;
