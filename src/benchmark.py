@@ -9,7 +9,8 @@ print("-" * 55)
 
 for t in threads:
     # Compile DPU binary with specific NR_TASKLETS
-    compile_cmd = f"dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS={t} -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2840 -o B+Tree.dpu dpu/B+Tree.c"
+    # Reduced STACK_SIZE_DEFAULT to avoid WRAM overflow with 16 tasklets and new struct sizes
+    compile_cmd = f"dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS={t} -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048 -o B+Tree.dpu dpu/B+Tree.c"
     subprocess.run(compile_cmd, shell=True, check=True, stderr=subprocess.DEVNULL)
     
     # Run Host

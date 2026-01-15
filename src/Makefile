@@ -10,7 +10,7 @@ DPU_SRC       := dpu/B+Tree.c
 HOST_CXXFLAGS += -O2 -std=c++17 $(shell dpu-pkg-config --cflags dpu)
 HOST_LDFLAGS  += $(shell dpu-pkg-config --libs dpu)
 
-DPU_CFLAGS    += -O2 -DNR_TASKLETS=16 -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2840
+DPU_CFLAGS    += -O2 -DNR_TASKLETS=16 -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048
 
 .PHONY: all clean run
 
