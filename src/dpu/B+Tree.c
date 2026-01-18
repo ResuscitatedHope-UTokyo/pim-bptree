@@ -18,6 +18,7 @@ BARRIER_INIT(init_barrier, NR_TASKLETS);
 // --- DPU B+ Tree Implementation ---
 
 #define MAX_KEYS 30
+#define MAX_BPTREE_HEIGHT 8
 // Alignment for Pointer Tagging (7 bits, 128-byte alignment)
 #define NODE_ALIGNMENT 128 // 7 bits for size (0-127)
 #define SIZE_MASK 0x7F     //   000001111111
@@ -71,6 +72,7 @@ typedef struct {
     __mram_ptr uint8_t* mram_ptr;
     __mram_ptr uint8_t* mram_end;
     __dma_aligned kvpair_t local_queries[BATCH_SIZE];
+    Node node_buf;
 } ThreadLocalData;
 
 // --- Parallel ---
@@ -143,51 +145,61 @@ static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mr
     LeafNode new_leaf_wram __dma_aligned;
     __mram_ptr LeafNode *new_leaf_addr = create_leaf_node(tls);
 
-    KeyType temp_keys[MAX_KEYS + 1];
-    ValueType temp_values[MAX_KEYS + 1];
+    // Determine split point
+    int total_keys = leaf_current_size + 1;
+    int split_val = total_keys / 2;
     
+    // Find where the new key fits
     int pos = 0;
     while (pos < leaf_current_size && leaf_wram->keys[pos] < key) pos++;
     
-    for(int k=0; k<pos; k++) {
-        temp_keys[k] = leaf_wram->keys[k];
-        temp_values[k] = leaf_wram->values[k];
-    }
-    temp_keys[pos] = key;
-    temp_values[pos] = value;
-    for(int k=pos; k<leaf_current_size; k++) {
-        temp_keys[k+1] = leaf_wram->keys[k];
-        temp_values[k+1] = leaf_wram->values[k];
-    }
-    
-    int total = MAX_KEYS + 1;
-    int split = total / 2;
-    
-    // Update old leaf (in WRAM)
-    int old_leaf_new_size = split;
-    // leaf_wram->num_keys = split; // REMOVED
-    for(int k=0; k<split; k++) {
-        leaf_wram->keys[k] = temp_keys[k];
-        leaf_wram->values[k] = temp_values[k];
-    }
-    
     new_leaf_wram.type = LEAF_NODE;
-    // new_leaf_wram.num_keys = total - split; // REMOVED
-    int new_leaf_size = total - split;
-    for(int k=0; k<new_leaf_size; k++) {
-        new_leaf_wram.keys[k] = temp_keys[split + k];
-        new_leaf_wram.values[k] = temp_values[split + k];
-    }
-    
     new_leaf_wram.next = leaf_wram->next;
     new_leaf_wram.prev = leaf_addr;
+
+    int right_count = total_keys - split_val;
     
-    // leaf_wram->next -> points to new_leaf, EMBEDDING new_leaf_size
+    if (pos >= split_val) {
+        // New key goes to Right Node
+        int r_idx = 0;
+        // Copy keys before insertion point
+        for (int k = split_val; k < pos; k++) {
+            new_leaf_wram.keys[r_idx] = leaf_wram->keys[k];
+            new_leaf_wram.values[r_idx] = leaf_wram->values[k];
+            r_idx++;
+        }
+        // Insert new key
+        new_leaf_wram.keys[r_idx] = key;
+        new_leaf_wram.values[r_idx] = value;
+        r_idx++;
+        // Copy remaining
+        for (int k = pos; k < leaf_current_size; k++) {
+            new_leaf_wram.keys[r_idx] = leaf_wram->keys[k];
+            new_leaf_wram.values[r_idx] = leaf_wram->values[k];
+            r_idx++;
+        }
+    } else {
+        // New key goes to Left Node
+        for (int k = 0; k < right_count; k++) {
+             new_leaf_wram.keys[k] = leaf_wram->keys[split_val - 1 + k];
+             new_leaf_wram.values[k] = leaf_wram->values[split_val - 1 + k];
+        }
+        
+        // Update Left Node
+        for (int k = split_val - 1; k > pos; k--) {
+            leaf_wram->keys[k] = leaf_wram->keys[k-1];
+            leaf_wram->values[k] = leaf_wram->values[k-1];
+        }
+        leaf_wram->keys[pos] = key;
+        leaf_wram->values[pos] = value;
+    }
+    
+    int old_leaf_new_size = split_val;
+    int new_leaf_size = right_count;
+    
     leaf_wram->next = PACK_LINK(new_leaf_addr, new_leaf_size);
     
-    // Update next leaf's prev pointer (if exists)
     __mram_ptr LeafNode* next_leaf_addr = UNPACK_ADDR(new_leaf_wram.next);
-    int next_leaf_size = UNPACK_SIZE(new_leaf_wram.next);
 
     if (next_leaf_addr != NULL) {
         LeafNode next_leaf __dma_aligned;
@@ -209,51 +221,78 @@ static void __attribute__((noinline)) split_internal_node(ThreadLocalData *tls, 
     InternalNode new_node_wram __dma_aligned;
     __mram_ptr InternalNode *new_node_addr = create_internal_node(tls);
     
-    KeyType temp_keys[MAX_KEYS + 1];
-    NodeLink temp_children[MAX_KEYS + 2];
+    int total_keys = node_current_size + 1; 
+    int split_idx = (total_keys) / 2;
     
+    // Find pos
     int pos = 0;
     while (pos < node_current_size && node_wram->keys[pos] < key) pos++;
     
-    for(int k=0; k<pos; k++) temp_keys[k] = node_wram->keys[k];
-    for(int k=0; k<=pos; k++) temp_children[k] = node_wram->children[k];
-    
-    temp_keys[pos] = key;
-    temp_children[pos+1] = child_link;
-    
-    for(int k=pos; k<node_current_size; k++) {
-        temp_keys[k+1] = node_wram->keys[k];
-        temp_children[k+2] = node_wram->children[k+1];
-    }
-    
-    int total_keys = MAX_KEYS + 1;
-    int split_idx = total_keys / 2;
-    *up_key = temp_keys[split_idx];
-    
-    // left part: only save split_idx keys
-    int left_size = split_idx; 
-    // node_wram->num_keys = split_idx; // REMOVED
-    for(int k=0; k<split_idx; k++) {
-        node_wram->keys[k] = temp_keys[k];
-        node_wram->children[k] = temp_children[k];
-    }
-    node_wram->children[split_idx] = temp_children[split_idx];
-    
-    // right part: from split_idx+1 to end
     new_node_wram.type = INTERNAL_NODE;
-    int right_size = total_keys - split_idx - 1;
-    // new_node_wram.num_keys = right_size; // REMOVED
-    
-    for(int k=0; k<right_size; k++) {
-        new_node_wram.keys[k] = temp_keys[split_idx + 1 + k];
-        new_node_wram.children[k] = temp_children[split_idx + 1 + k];
+
+    if (pos == split_idx) {
+        *up_key = key;
+        new_node_wram.children[0] = child_link;
+        int count = 0;
+        for (int k = pos; k < node_current_size; k++) {
+            new_node_wram.keys[count] = node_wram->keys[k];
+            new_node_wram.children[count+1] = node_wram->children[k+1];
+            count++;
+        }
+        *new_node_size_out = count;
+        *old_node_new_size_out = pos;
+        
+    } else if (pos > split_idx) {
+        *up_key = node_wram->keys[split_idx];
+        
+        int r_idx = 0;
+        // Right starts with child at split_idx + 1
+        new_node_wram.children[0] = node_wram->children[split_idx + 1];
+        
+        // Copy keys from split_idx+1 to pos
+        for (int k = split_idx + 1; k < pos; k++) {
+            new_node_wram.keys[r_idx] = node_wram->keys[k];
+            new_node_wram.children[r_idx+1] = node_wram->children[k+1];
+            r_idx++;
+        }
+        // Insert new Key
+        new_node_wram.keys[r_idx] = key;
+        new_node_wram.children[r_idx+1] = child_link;
+        r_idx++;
+        // Copy rest
+        for (int k = pos; k < node_current_size; k++) {
+            new_node_wram.keys[r_idx] = node_wram->keys[k];
+            new_node_wram.children[r_idx+1] = node_wram->children[k+1];
+            r_idx++;
+        }
+        
+        *new_node_size_out = r_idx;
+        *old_node_new_size_out = split_idx;
+        
+    } else { // pos < split_idx
+        *up_key = node_wram->keys[split_idx - 1]; 
+        
+        new_node_wram.children[0] = node_wram->children[split_idx];
+        int r_idx = 0;
+        for (int k = split_idx; k < node_current_size; k++) {
+            new_node_wram.keys[r_idx] = node_wram->keys[k];
+            new_node_wram.children[r_idx+1] = node_wram->children[k+1];
+            r_idx++;
+        }
+        *new_node_size_out = r_idx;
+        
+        // Fix Left Node
+        for (int k = split_idx - 1; k > pos; k--) {
+             node_wram->keys[k] = node_wram->keys[k-1];
+             node_wram->children[k+1] = node_wram->children[k];
+        }
+        node_wram->keys[pos] = key;
+        node_wram->children[pos+1] = child_link;
+        
+        *old_node_new_size_out = split_idx;
     }
-    new_node_wram.children[right_size] = temp_children[total_keys];
     
     *new_node_out = new_node_addr;
-    *new_node_size_out = right_size;
-    *old_node_new_size_out = left_size;
-    
     mram_write(&new_node_wram, new_node_addr, sizeof(InternalNode));
     mram_write(node_wram, node_addr, sizeof(InternalNode));
 }
@@ -284,35 +323,34 @@ bool bptree_insert_thread(int thread_id, __mram_ptr void** root_ptr, int* root_s
         return true;
     }
     
-    __mram_ptr void* path[16];
-    int path_size[16]; // Store the size of each node in path
-    int child_indices[16]; // Index in parent's children array
+    __mram_ptr void* path[MAX_BPTREE_HEIGHT];
+    int path_size[MAX_BPTREE_HEIGHT]; // Store the size of each node in path
+    int child_indices[MAX_BPTREE_HEIGHT]; // Index in parent's children array
     
     int depth = 0;
     __mram_ptr void* curr = *root_ptr;
     int curr_size = *root_size_ptr; // Start with known root size
     
-    Node node_buf;
     
-    mram_read(curr, &node_buf, sizeof(Node));
-    while (node_buf.internal.type == INTERNAL_NODE) {
+    mram_read(curr, &tls->node_buf, sizeof(Node));
+    while (tls->node_buf.internal.type == INTERNAL_NODE) {
         path[depth] = curr;
         path_size[depth] = curr_size;
         
-        int idx = find_child_index(&node_buf.internal, curr_size, key);
+        int idx = find_child_index(&tls->node_buf.internal, curr_size, key);
         child_indices[depth] = idx;
         
         depth++;
         
         // Unpack next child
-        NodeLink next_link = node_buf.internal.children[idx];
+        NodeLink next_link = tls->node_buf.internal.children[idx];
         curr = UNPACK_ADDR(next_link);
         curr_size = UNPACK_SIZE(next_link); // Get size from pointer
         
-        mram_read(curr, &node_buf, sizeof(Node));
+        mram_read(curr, &tls->node_buf, sizeof(Node));
     }
 
-    LeafNode *leaf = &node_buf.leaf;
+    LeafNode *leaf = &tls->node_buf.leaf;
     // If key exists, update    
     for(int i=0; i<curr_size; i++) {
         if (leaf->keys[i] == key) {
@@ -647,84 +685,8 @@ static void merge_forests() {
 
 __dma_aligned kvpair_t local_queries[BATCH_SIZE];
 
-static void __attribute__((noinline)) serial_initialization(int thread_id) {
-    int total_queries = 500000; 
-    for (int i = 0; i < total_queries; i += BATCH_SIZE) {
-        int count = total_queries - i;
-        if (count > BATCH_SIZE) count = BATCH_SIZE;
-        // read 64 k-v pairs per batch of queries to WRAM
-        mram_read(&query_buffer[i], local_queries, count * sizeof(kvpair_t));
-        
-        for (int j = 0; j < count; j++) {
-            bptree_insert_thread(thread_id, &global_root, &global_root_size_var, local_queries[j].key, local_queries[j].value);
-        }
-    }
-    
-    // Calculate Split Keys, traverse the leaves to find split points
-    int leaf_count = 0;
-    __mram_ptr void* curr = global_root;
-    // Go to leftmost leaf node
-    while(curr) {
-        Node n;
-        mram_read(curr, &n, sizeof(Node));
-        if (n.internal.type == LEAF_NODE) break;
-        curr = UNPACK_ADDR(n.internal.children[0]);
-    }
-    // calculate total leaf nodes
-    __mram_ptr LeafNode* first_leaf = (__mram_ptr LeafNode*)curr;
-    __mram_ptr LeafNode* l = first_leaf;
-    while(l) {
-        leaf_count++;
-        LeafNode ln;
-        mram_read(l, &ln, sizeof(LeafNode));
-        l = UNPACK_ADDR(ln.next);
-    }
-    
-    split_keys[0] = INT32_MIN;
-    split_keys[NR_TASKLETS] = INT32_MAX;
-    for(int i=1; i<NR_TASKLETS; i++) split_keys[i] = INT32_MAX;
-    
-    if (leaf_count > 0) {
-        l = first_leaf;
-        int current_leaf_idx = 0;
-        int split_idx = 1;
-        while(l && split_idx < NR_TASKLETS) {
-            current_leaf_idx++;
-            // split_idx-th split key at current_leaf_idx-th leaf
-            int target_idx = (long)split_idx * leaf_count / NR_TASKLETS;
-            
-            LeafNode ln;
-            mram_read(l, &ln, sizeof(LeafNode));
-            
-            if (current_leaf_idx == target_idx) {
-                if (UNPACK_ADDR(ln.next)) {
-                    LeafNode next_ln;
-                    // read next leaf
-                    mram_read(UNPACK_ADDR(ln.next), &next_ln, sizeof(LeafNode));
-                    // 1st key as the split key
-                    split_keys[split_idx] = next_ln.keys[0];
-                }
-                split_idx++;
-            }
-            l = UNPACK_ADDR(ln.next);
-        }
-    }
-    
-    // 2. Distribute Subtrees
-    int height = 0;
-    curr = global_root;
-    if (curr) {
-        height = 1;
-        while(1) {
-            Node n;
-            mram_read(curr, &n, sizeof(Node));
-            if (n.internal.type == LEAF_NODE) break;
-            curr = UNPACK_ADDR(n.internal.children[0]);
-            height++;
-        }
-    }
-    
-    distribute_subtrees(height);
+static void serial_initialization(int thread_id) {
+    // Inlined into main to save stack space
 }
 
 int main()
@@ -744,7 +706,83 @@ int main()
     
     // 1. Serial Initialization (Thread 0)—— Insert 500,000 keys
     if (thread_id == 0) {
-        serial_initialization(thread_id);
+        int total_queries = 500000; 
+        for (int i = 0; i < total_queries; i += BATCH_SIZE) {
+            int count = total_queries - i;
+            if (count > BATCH_SIZE) count = BATCH_SIZE;
+            // read 64 k-v pairs per batch of queries to WRAM
+            mram_read(&query_buffer[i], local_queries, count * sizeof(kvpair_t));
+            
+            for (int j = 0; j < count; j++) {
+                bptree_insert_thread(thread_id, &global_root, &global_root_size_var, local_queries[j].key, local_queries[j].value);
+            }
+        }
+        
+        // Calculate Split Keys, traverse the leaves to find split points
+        int leaf_count = 0;
+        __mram_ptr void* curr = global_root;
+        // Go to leftmost leaf node
+        while(curr) {
+            Node n;
+            mram_read(curr, &n, sizeof(Node));
+            if (n.internal.type == LEAF_NODE) break;
+            curr = UNPACK_ADDR(n.internal.children[0]);
+        }
+        // calculate total leaf nodes
+        __mram_ptr LeafNode* first_leaf = (__mram_ptr LeafNode*)curr;
+        __mram_ptr LeafNode* l = first_leaf;
+        while(l) {
+            leaf_count++;
+            LeafNode ln;
+            mram_read(l, &ln, sizeof(LeafNode));
+            l = UNPACK_ADDR(ln.next);
+        }
+        
+        split_keys[0] = INT32_MIN;
+        split_keys[NR_TASKLETS] = INT32_MAX;
+        for(int i=1; i<NR_TASKLETS; i++) split_keys[i] = INT32_MAX;
+        
+        if (leaf_count > 0) {
+            l = first_leaf;
+            int current_leaf_idx = 0;
+            int split_idx = 1;
+            while(l && split_idx < NR_TASKLETS) {
+                current_leaf_idx++;
+                // split_idx-th split key at current_leaf_idx-th leaf
+                int target_idx = (long)split_idx * leaf_count / NR_TASKLETS;
+                
+                LeafNode ln;
+                mram_read(l, &ln, sizeof(LeafNode));
+                
+                if (current_leaf_idx == target_idx) {
+                    if (UNPACK_ADDR(ln.next)) {
+                        LeafNode next_ln;
+                        // read next leaf
+                        mram_read(UNPACK_ADDR(ln.next), &next_ln, sizeof(LeafNode));
+                        // 1st key as the split key
+                        split_keys[split_idx] = next_ln.keys[0];
+                    }
+                    split_idx++;
+                }
+                l = UNPACK_ADDR(ln.next);
+            }
+        }
+        
+        // 2. Distribute Subtrees
+        int height = 0;
+        curr = global_root;
+        if (curr) {
+            height = 1;
+            while(1) {
+                Node n;
+                mram_read(curr, &n, sizeof(Node));
+                if (n.internal.type == LEAF_NODE) break;
+                curr = UNPACK_ADDR(n.internal.children[0]);
+                height++;
+            }
+        }
+        
+        distribute_subtrees(height);
     }
     
     barrier_wait(&init_barrier);
