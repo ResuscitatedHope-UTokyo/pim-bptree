@@ -16,9 +16,7 @@ for t in threads:
     # Run Host
     run_cmd = "./host B+Tree.dpu"
     result = subprocess.run(run_cmd, shell=True, capture_output=True, text=True)
-    
-    # Parse output
-    # Looking for: Insert: 0.001 sec, Merge: 0.002 sec, Total: 0.003 sec
+
     match = re.search(r"Insert: ([0-9.]+) sec, Merge: ([0-9.]+) sec, Total: ([0-9.]+) sec", result.stdout)
     if match:
         insert_t = match.group(1)
