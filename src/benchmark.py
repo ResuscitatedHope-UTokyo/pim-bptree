@@ -1,6 +1,12 @@
 import subprocess
 import re
 
+try:
+    commit_id = subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode('utf-8')
+    print(f"Current Git Commit: {commit_id}")
+except:
+    print("Could not get git commit id")
+# exit(0)
 threads = [1, 2, 4, 8, 16]
 results = {}
 
@@ -31,4 +37,3 @@ for t in threads:
         else:
             print(f"{t:<10} | {'Error':<12} | {'Error':<12} | {'Error':<12}")
             # print(result.stdout)
-
