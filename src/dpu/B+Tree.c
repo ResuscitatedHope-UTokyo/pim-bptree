@@ -334,8 +334,18 @@ bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* roo
     __mram_ptr void* curr = *root_ptr;
     int curr_size = *root_size_ptr; 
     
-    
-    mram_read(curr, &tls->node_buf, sizeof(Node));
+    // [Occupancy Embedding Optimization]
+    // Calculate exact transfer size based on occupancy.
+    // Layout: Header(4) + Keys(120) + Children/Values...
+    // Both Internal and Leaf start Children/Values at offset 124.
+    // We strictly need up to 124 + (size + 1) * 4 bytes to cover:
+    // - Internal: size keys, size+1 children
+    // - Leaf: size keys, size values
+    // Align to 8 bytes for DMA interaction.
+    int read_len = (124 + (curr_size + 1) * 4 + 7) & ~7;
+    if (read_len > sizeof(Node)) read_len = sizeof(Node);
+
+    mram_read(curr, &tls->node_buf, read_len);
     while (tls->node_buf.internal.type == INTERNAL_NODE) {
         path[depth] = curr;
         path_size[depth] = curr_size;
@@ -350,8 +360,18 @@ bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* roo
         curr = UNPACK_ADDR(next_link);
         curr_size = UNPACK_SIZE(next_link);
         
-        mram_read(curr, &tls->node_buf, sizeof(Node));
+        read_len = (124 + (curr_size + 1) * 4 + 7) & ~7;
+        if (read_len > sizeof(Node)) read_len = sizeof(Node);
+        
+        mram_read(curr, &tls->node_buf, read_len);
     }
+
+    // The optimization above reads only valid keys/values.
+    // However, LeafNode stores 'next' and 'prev' pointers at the VERY END of the struct (offset 244/248).
+    // If we only read partial data, 'next' and 'prev' in wram contain garbage.
+    // When we later mram_write the full node, we corrupt the linked list in MRAM.
+    // MUST read the full leaf node here to ensure next/prev are loaded.
+    mram_read(curr, &tls->node_buf, sizeof(LeafNode));
 
     LeafNode *leaf = &tls->node_buf.leaf;
     // If key exists, update    
