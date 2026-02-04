@@ -1024,7 +1024,7 @@ int main()
     int m_end = measure_start + (thread_id + 1) * m_chunk;
     if (thread_id == NR_TASKLETS - 1) m_end = measure_start + measure_count;
     
-    perfcounter_t start_time, end_time, insert_end_time = 0;
+    perfcounter_t start_time, end_time, insert_end_time = 0, para_merge_end_time = 0;
     if (thread_id == 0) start_time = perfcounter_get();
     
 
@@ -1088,6 +1088,7 @@ int main()
     parallel_merge_local(thread_id);
     
     barrier_wait(&init_barrier);
+    if(thread_id == 0) para_merge_end_time = perfcounter_get();
     
     // Phase 2: Serial Merge (Thread 0)
     serial_merge_all(thread_id);
@@ -1098,10 +1099,12 @@ int main()
     // Output (Thread 0)
     if (thread_id == 0) {
         float insert_time = (float)(insert_end_time - start_time) / (float)CLOCKS_PER_SEC;
+        float para_merge_time = (float)(para_merge_end_time - insert_end_time) / (float)CLOCKS_PER_SEC;
+        float serial_merge_time = (float)(end_time - para_merge_end_time) / (float)CLOCKS_PER_SEC;
         float merge_time = (float)(end_time - insert_end_time) / (float)CLOCKS_PER_SEC;
         float total_time = (float)(end_time - start_time) / (float)CLOCKS_PER_SEC;
         
-        printf("Insert: %f sec, Merge: %f sec, Total: %f sec\n", insert_time, merge_time, total_time);
+        printf("Insert: %f sec, ParallelMerge: %f sec, SerialMerge: %f sec, Merge: %f sec, Total: %f sec\n", insert_time, para_merge_time, serial_merge_time, merge_time, total_time);
         printf("Elapsed time: %f sec\n", total_time);
        
     }
