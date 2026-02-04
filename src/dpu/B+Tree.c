@@ -43,8 +43,7 @@ typedef uint32_t NodeLink;
 #define UNPACK_ADDR(link)       ((__mram_ptr void*)((uintptr_t)((link) & PTR_MASK)))
 #define UNPACK_SIZE(link)       ((int)((link) & SIZE_MASK))
 
-KeyType first_keys[MAX_TOTAL_ROOTS];
-int heights[MAX_TOTAL_ROOTS];
+
 
 struct __dma_aligned LeafNode {
     NodeType type; // 4
@@ -600,273 +599,312 @@ static void distribute_subtrees(int root_height) {
     distribute_subtrees_recursive(global_root, global_root_size_var, INT32_MIN, INT32_MAX, root_height);
 }
 
- __mram_ptr void* roots[MAX_TOTAL_ROOTS];
- int root_sizes[MAX_TOTAL_ROOTS]; 
 
-__mram_ptr void* roots_alt[MAX_TOTAL_ROOTS];
-int root_sizes_alt[MAX_TOTAL_ROOTS];
 
-static void merge_forests_serial(int thread_id) {
-    if (thread_id != 0) return;
+// Serial merge removed. New implementation coming.
 
-    // --- 1. Collect all roots ---
-    int total_roots = 0;
-    int max_height = 0;
-    
-    for(int i=0; i<NR_TASKLETS; i++) {
-        for(int j=0; j<thread_forests[i].count; j++) {
-            if (total_roots < MAX_TOTAL_ROOTS) {
-                roots[total_roots] = thread_forests[i].subtrees[j].root;
-                root_sizes[total_roots] = thread_forests[i].subtrees[j].root_size;
-                
-                NodeType type;
-                uint64_t type_buf;
-                mram_read(roots[total_roots], &type_buf, 8);
-                type = (NodeType)type_buf;
+// --- New Merge Algorithm ---
 
-                if (type == LEAF_NODE) {
-                    LeafNode l __dma_aligned;
-                    mram_read(roots[total_roots], &l, sizeof(LeafNode));
-                    first_keys[total_roots] = l.keys[0];
-                } else {
-                    first_keys[total_roots] = thread_forests[i].subtrees[j].min_key;
-                }
-                
-                heights[total_roots] = thread_forests[i].subtrees[j].height;
-                if (heights[total_roots] > max_height) max_height = heights[total_roots];
-                total_roots++;
-            }
-        }
+// Helper struct for leaf traversal
+typedef struct {
+    __mram_ptr LeafNode* addr;
+    int size;
+} LeafInfo;
+
+LeafInfo get_leftmost_leaf(__mram_ptr void* root, int root_size, int height) {
+    if (root == NULL) return (LeafInfo){NULL, 0};
+    __mram_ptr void* curr = root;
+    int curr_size = root_size;
+    while(height > 1) {
+         InternalNode node;
+         mram_read(curr, &node, sizeof(InternalNode));
+         NodeLink link = node.children[0];
+         curr = UNPACK_ADDR(link);
+         curr_size = UNPACK_SIZE(link);
+         height--;
     }
-    
-    global_root_size_var = total_roots;
-    
-    // --- 2. Adjust heights (Serial) ---
-    // 由于分发和插入后子树高度可能不同，需要先调整到相同高度
-    if (total_roots > 0) {
-        ThreadLocalData *tls = &thread_data[0];
-        while(1) {
-            int min_h = max_height + 1;
-            for(int i=0; i<total_roots; i++) if (heights[i] < min_h) min_h = heights[i];
-            if (min_h >= max_height) break;
-            
-            int i = 0;
-            while(i < total_roots) {
-                if (heights[i] == min_h) {
-                    // Case 1: Merge with Right neighbor of same height
-                    if (i + 1 < total_roots && heights[i+1] == min_h) {
-                        __mram_ptr InternalNode *parent = create_internal_node(tls);
-                        InternalNode p __dma_aligned;
-                        memset(&p, 0, sizeof(InternalNode));
-                        p.type = INTERNAL_NODE;
-                        p.children[0] = PACK_LINK(roots[i], root_sizes[i]);
-                        p.children[1] = PACK_LINK(roots[i+1], root_sizes[i+1]);
-                        NodeType type;
-                        uint64_t type_buf;
-                        mram_read(roots[i+1], &type_buf, 8);
-                        type = (NodeType)type_buf;
-                        if (type == LEAF_NODE) {
-                            LeafNode l __dma_aligned;
-                            mram_read(roots[i+1], &l, sizeof(LeafNode));
-                            p.keys[0] = l.keys[0];
-                        } else {
-                            p.keys[0] = first_keys[i+1];
-                        }
-                        mram_write(&p, parent, sizeof(InternalNode));
-                        roots[i] = (__mram_ptr void*)parent;
-                        root_sizes[i] = 1;
-                        heights[i] = min_h + 1;
-                        for(int k=i+1; k<total_roots-1; k++) {
-                            roots[k] = roots[k+1];
-                            root_sizes[k] = root_sizes[k+1];
-                            first_keys[k] = first_keys[k+1];
-                            heights[k] = heights[k+1];
-                        }
-                        total_roots--;
-                        i++;
-                    } else {
-                        // Case 2: Try to merge/balance with neighbor of height min_h+1
-                        __mram_ptr InternalNode *wrapper = create_internal_node(tls);
-                        InternalNode w __dma_aligned;
-                        memset(&w, 0, sizeof(InternalNode));
-                        w.type = INTERNAL_NODE;
-                        w.children[0] = PACK_LINK(roots[i], root_sizes[i]);
-                        mram_write(&w, wrapper, sizeof(InternalNode));
-                        
-                        bool merged = false;
-                        bool balanced = false;
-                        
-                        // Try Left neighbor
-                        if (i > 0 && heights[i-1] == min_h + 1) {
-                            InternalNode parent __dma_aligned;
-                            mram_read(roots[i-1], &parent, sizeof(InternalNode));
-                            int num_keys = root_sizes[i-1];
-                            if (num_keys < MAX_KEYS) {
-                                parent.children[num_keys + 1] = PACK_LINK(roots[i], root_sizes[i]);
-                                parent.keys[num_keys] = first_keys[i];
-                                mram_write(&parent, roots[i-1], sizeof(InternalNode));
-                                root_sizes[i-1]++;
-                                merged = true;
-                            } else {
-                                // Redistribute from left
-                                int move_cnt = 15;
-                                InternalNode me __dma_aligned;
-                                mram_read(roots[i], &me, sizeof(InternalNode));
-                                me.children[move_cnt] = me.children[0];
-                                me.keys[move_cnt - 1] = first_keys[i];
-                                int start_src_idx = num_keys + 1 - move_cnt;
-                                for(int k=0; k<move_cnt; k++) me.children[k] = parent.children[start_src_idx + k];
-                                for(int k=0; k<move_cnt-1; k++) me.keys[k] = parent.keys[start_src_idx + k];
-                                first_keys[i] = parent.keys[start_src_idx - 1];
-                                root_sizes[i] = move_cnt;
-                                root_sizes[i-1] -= move_cnt;
-                                mram_write(&parent, roots[i-1], sizeof(InternalNode));
-                                mram_write(&me, roots[i], sizeof(InternalNode));
-                                balanced = true;
-                            }
-                        }
-                        // Try Right neighbor
-                        if (!merged && !balanced && i + 1 < total_roots && heights[i+1] == min_h + 1) {
-                            InternalNode right __dma_aligned;
-                            mram_read(roots[i+1], &right, sizeof(InternalNode));
-                            int num_keys_right = root_sizes[i+1];
-                            if (num_keys_right < MAX_KEYS) {
-                                for(int k=num_keys_right; k>0; k--) right.keys[k] = right.keys[k-1];
-                                for(int k=num_keys_right+1; k>0; k--) right.children[k] = right.children[k-1];
-                                right.children[0] = PACK_LINK(roots[i], root_sizes[i]);
-                                right.keys[0] = first_keys[i+1];
-                                first_keys[i+1] = first_keys[i];
-                                mram_write(&right, roots[i+1], sizeof(InternalNode));
-                                root_sizes[i+1]++;
-                                merged = true;
-                            } else {
-                                // Redistribute from right
-                                int move_cnt = 15;
-                                InternalNode me __dma_aligned;
-                                mram_read(roots[i], &me, sizeof(InternalNode));
-                                me.keys[0] = first_keys[i+1];
-                                for(int k=0; k<move_cnt; k++) me.children[k+1] = right.children[k];
-                                for(int k=0; k<move_cnt-1; k++) me.keys[k+1] = right.keys[k];
-                                first_keys[i+1] = right.keys[move_cnt - 1];
-                                int shift = move_cnt;
-                                int remaining = num_keys_right - shift;
-                                for(int k=0; k<remaining; k++) right.keys[k] = right.keys[k + shift];
-                                for(int k=0; k<=remaining; k++) right.children[k] = right.children[k + shift];
-                                root_sizes[i] = move_cnt;
-                                root_sizes[i+1] = remaining;
-                                mram_write(&right, roots[i+1], sizeof(InternalNode));
-                                mram_write(&me, roots[i], sizeof(InternalNode));
-                                balanced = true;
-                            }
-                        }
-                        
-                        if (merged) {
-                            for(int k=i; k<total_roots-1; k++) {
-                                roots[k] = roots[k+1];
-                                root_sizes[k] = root_sizes[k+1];
-                                first_keys[k] = first_keys[k+1];
-                                heights[k] = heights[k+1];
-                            }
-                            total_roots--;
-                        } else if (balanced) {
-                            heights[i] = min_h + 1;
-                            i++;
-                        } else {
-                            roots[i] = (__mram_ptr void*)wrapper;
-                            root_sizes[i] = 0;
-                            heights[i] = min_h + 1;
-                            i++;
-                        }
-                    }
-                } else {
-                    i++;
-                }
-            }
-        }
-    }
-    global_root_size_var = total_roots;
-    
-    // --- 3. Serial Build - 自底向上构建共享部分 ---
-    int current_count = total_roots;
-    __mram_ptr void** src_level = roots;
-    int* src_sizes = root_sizes;
-    __mram_ptr void** dst_level = roots_alt;
-    int* dst_sizes = root_sizes_alt;
-    
-    while(current_count > 1) {
-        int capacity = MAX_KEYS + 1;
-        int num_parents_needed = (current_count + capacity - 1) / capacity;
-        
-        ThreadLocalData *tls = &thread_data[thread_id];
-        
-        int msg_base_count = current_count / num_parents_needed;
-        int msg_remainder = current_count % num_parents_needed;
-        
-        int current_child_idx = 0;
-        
-        for(int k = 0; k < num_parents_needed; k++) {
-            // My contribution
-            int child_count = msg_base_count + (k < msg_remainder ? 1 : 0);
-            
-            __mram_ptr InternalNode *parent = create_internal_node(tls);
-            InternalNode p __dma_aligned;
-            memset(&p, 0, sizeof(InternalNode));
-            p.type = INTERNAL_NODE;
-            
-            for(int j=0; j<child_count; j++) {
-                p.children[j] = PACK_LINK(src_level[current_child_idx + j], src_sizes[current_child_idx + j]);
-                if (j > 0) {
-                    NodeType type;
-                    uint64_t type_buf;
-                    mram_read(src_level[current_child_idx + j], &type_buf, 8);
-                    type = (NodeType)type_buf;
+    return (LeafInfo){(__mram_ptr LeafNode*)curr, curr_size};
+}
 
-                    if (type == LEAF_NODE) {
-                        LeafNode l __dma_aligned;
-                        mram_read(src_level[current_child_idx + j], &l, sizeof(LeafNode));
-                        p.keys[j-1] = l.keys[0];
-                    } else {
-                        __mram_ptr void* curr = src_level[current_child_idx + j];
-                        while(1) {
-                            InternalNode in __dma_aligned;
-                            mram_read(curr, &in, sizeof(InternalNode));
-                            if (in.type == LEAF_NODE) {
-                                LeafNode l __dma_aligned;
-                                mram_read(curr, &l, sizeof(LeafNode));
-                                p.keys[j-1] = l.keys[0];
-                                break;
-                            }
-                            curr = UNPACK_ADDR(in.children[0]);
-                        }
-                    }
-                }
-            }
-            mram_write(&p, parent, sizeof(InternalNode));
-            dst_level[k] = (__mram_ptr void*)parent;
-            dst_sizes[k] = child_count - 1;
-            
-            current_child_idx += child_count;
+LeafInfo get_rightmost_leaf(__mram_ptr void* root, int root_size, int height) {
+    if (root == NULL) return (LeafInfo){NULL, 0};
+    __mram_ptr void* curr = root;
+    int curr_size = root_size;
+    while(height > 1) {
+         InternalNode node;
+         mram_read(curr, &node, sizeof(InternalNode));
+         // Rightmost child is at index curr_size
+         NodeLink link = node.children[curr_size];
+         curr = UNPACK_ADDR(link);
+         curr_size = UNPACK_SIZE(link);
+         height--;
+    }
+    return (LeafInfo){(__mram_ptr LeafNode*)curr, curr_size};
+}
+
+void connect_leaf_list(Subtree left, Subtree right) {
+    if (left.root == NULL || right.root == NULL) return;
+    
+    LeafInfo l_info = get_rightmost_leaf(left.root, left.root_size, left.height);
+    LeafInfo r_info = get_leftmost_leaf(right.root, right.root_size, right.height);
+    
+    if (l_info.addr && r_info.addr) {
+        LeafNode l_node;
+        mram_read(l_info.addr, &l_node, sizeof(LeafNode));
+        
+        // Link left -> right
+        l_node.next = PACK_LINK(r_info.addr, r_info.size);
+        mram_write(&l_node, l_info.addr, sizeof(LeafNode));
+        
+        LeafNode r_node;
+        mram_read(r_info.addr, &r_node, sizeof(LeafNode));
+        
+        // Link right -> prev = left
+        r_node.prev = l_info.addr;
+        mram_write(&r_node, r_info.addr, sizeof(LeafNode));
+    }
+}
+
+Subtree merge_same_height(int thread_id, Subtree t_left, Subtree t_right) {
+    ThreadLocalData *tls = &thread_data[thread_id];
+    __mram_ptr InternalNode *new_root = create_internal_node(tls);
+    
+    InternalNode root;
+    memset(&root, 0, sizeof(InternalNode)); // Important to init children to 0/NULL
+    root.type = INTERNAL_NODE;
+    
+    // Child 0: Left Tree
+    root.children[0] = PACK_LINK(t_left.root, t_left.root_size);
+    // Key 0: Right Tree's min key
+    root.keys[0] = t_right.min_key;
+    // Child 1: Right Tree
+    root.children[1] = PACK_LINK(t_right.root, t_right.root_size);
+    
+    mram_write(&root, new_root, sizeof(InternalNode));
+    
+    Subtree res;
+    res.root = (__mram_ptr void*)new_root;
+    res.root_size = 1; // 1 key
+    res.min_key = t_left.min_key;
+    res.max_key = t_right.max_key;
+    res.height = t_left.height + 1; // Height increases by 1
+    return res;
+}
+
+// Helper to insert (key, link) into a node along the path and propagate splits
+void insert_and_propagate(int thread_id, 
+                          __mram_ptr void** path, int* path_sizes, int* child_indices, int start_depth,
+                          KeyType key, NodeLink child_link,
+                          Subtree* tree_to_update) {
+    
+    ThreadLocalData *tls = &thread_data[thread_id];
+    int depth = start_depth;
+    KeyType up_key = key;
+    NodeLink current_child_link = child_link;
+    
+    while(depth >= 0) {
+        __mram_ptr void* parent_ptr = path[depth];
+        int parent_size = path_sizes[depth];
+        
+        InternalNode parent;
+        mram_read(parent_ptr, &parent, sizeof(InternalNode));
+        
+        if (parent_size < MAX_KEYS) {
+             int pos = 0;
+             while (pos < parent_size && parent.keys[pos] < up_key) pos++;
+             
+             for(int k=parent_size; k>pos; k--) {
+                parent.keys[k] = parent.keys[k-1];
+                parent.children[k+1] = parent.children[k];
+             }
+             parent.keys[pos] = up_key;
+             parent.children[pos+1] = current_child_link;
+             
+             mram_write(&parent, parent_ptr, sizeof(InternalNode));
+             
+             int current_node_new_size = parent_size + 1;
+             
+             // Propagate size update upwards
+             for (int d = depth - 1; d >= 0; d--) {
+                 InternalNode gp;
+                 mram_read(path[d], &gp, sizeof(InternalNode));
+                 int idx = child_indices[d];
+                 gp.children[idx] = PACK_LINK(path[d+1], current_node_new_size);
+                 mram_write(&gp, path[d], sizeof(InternalNode));
+                 return;
+             }
+             
+             if (depth == 0) {
+                 tree_to_update->root_size = current_node_new_size;
+             }
+             return;
         }
         
+        // Split
+        __mram_ptr InternalNode *new_internal;
+        int new_internal_size, new_old_size;
+        split_internal_node(tls, (__mram_ptr InternalNode*)parent_ptr, &parent, parent_size, up_key, current_child_link, &up_key, &new_internal, &new_internal_size, &new_old_size);
         
-        // Swap
-         current_count = num_parents_needed;
-         
-         __mram_ptr void** temp_level = src_level;
-         src_level = dst_level;
-         dst_level = temp_level;
-         
-         int* temp_sizes = src_sizes;
-         src_sizes = dst_sizes;
-         dst_sizes = temp_sizes;
+        current_child_link = PACK_LINK(new_internal, new_internal_size);
+        
+        // Update size of the LEFT split node in the parent (grandparent)
+        if (depth > 0) {
+            InternalNode gp;
+            mram_read(path[depth-1], &gp, sizeof(InternalNode));
+            int idx = child_indices[depth-1];
+            gp.children[idx] = PACK_LINK(parent_ptr, new_old_size);
+            mram_write(&gp, path[depth-1], sizeof(InternalNode));
+        } else {
+            // Root split
+             tree_to_update->root_size = new_old_size;
+             
+             __mram_ptr InternalNode *new_root = create_internal_node(tls);
+             InternalNode r;
+             memset(&r, 0, sizeof(InternalNode));
+             r.type = INTERNAL_NODE;
+             r.children[0] = PACK_LINK(parent_ptr, new_old_size);
+             r.keys[0] = up_key;
+             r.children[1] = current_child_link;
+             
+             mram_write(&r, new_root, sizeof(InternalNode));
+             tree_to_update->root = (__mram_ptr void*)new_root;
+             tree_to_update->root_size = 1;
+             tree_to_update->height++;
+             return; 
+        }
+        
+        depth--;
+    }
+}
+
+Subtree merge_left_shorter(int thread_id, Subtree t_left, Subtree t_right) {
+    int target_h = t_left.height + 1;
+    __mram_ptr void* path[MAX_BPTREE_HEIGHT];
+    int path_sizes[MAX_BPTREE_HEIGHT];
+    int child_indices[MAX_BPTREE_HEIGHT];
+    int depth = 0;
+    
+    __mram_ptr void* curr = t_right.root;
+    int curr_size = t_right.root_size;
+    int curr_h = t_right.height;
+    
+    // Decend along left edge (index 0)
+    while(curr_h > target_h) {
+        path[depth] = curr;
+        path_sizes[depth] = curr_size;
+        child_indices[depth] = 0; // Always go left
+        depth++;
+        
+        InternalNode node;
+        mram_read(curr, &node, sizeof(InternalNode));
+        NodeLink child = node.children[0];
+        curr = UNPACK_ADDR(child);
+        curr_size = UNPACK_SIZE(child);
+        curr_h--;
     }
     
-    if (current_count == 1) {
-            global_root = src_level[0]; // src is the latest result
-            global_root_size_var = src_sizes[0];
+    path[depth] = curr;
+    path_sizes[depth] = curr_size;
+    
+    insert_and_propagate(thread_id, path, path_sizes, child_indices, depth, 
+                         t_right.min_key, PACK_LINK(t_left.root, t_left.root_size), 
+                         &t_right);
+                         
+    t_right.min_key = t_left.min_key;
+    return t_right;
+}
+
+Subtree merge_right_shorter(int thread_id, Subtree t_left, Subtree t_right) {
+    int target_h = t_right.height + 1;
+    __mram_ptr void* path[MAX_BPTREE_HEIGHT];
+    int path_sizes[MAX_BPTREE_HEIGHT];
+    int child_indices[MAX_BPTREE_HEIGHT];
+    int depth = 0;
+    
+    __mram_ptr void* curr = t_left.root;
+    int curr_size = t_left.root_size;
+    int curr_h = t_left.height;
+    
+    // Decend along right edge
+    while(curr_h > target_h) {
+        path[depth] = curr;
+        path_sizes[depth] = curr_size;
+        child_indices[depth] = curr_size; // Go rightmost (index = size)
+        depth++;
+        
+        InternalNode node;
+        mram_read(curr, &node, sizeof(InternalNode));
+        NodeLink child = node.children[curr_size];
+        curr = UNPACK_ADDR(child);
+        curr_size = UNPACK_SIZE(child);
+        curr_h--;
+    }
+    
+    path[depth] = curr;
+    path_sizes[depth] = curr_size;
+    
+    insert_and_propagate(thread_id, path, path_sizes, child_indices, depth, 
+                         t_right.min_key, PACK_LINK(t_right.root, t_right.root_size), 
+                         &t_left);
+                         
+    t_left.max_key = t_right.max_key;
+    return t_left;
+}
+
+Subtree merge_two_trees(int thread_id, Subtree t_left, Subtree t_right) {
+    // 0. Connect Leaf Lists
+    connect_leaf_list(t_left, t_right);
+    
+    if (t_left.height == t_right.height) {
+        return merge_same_height(thread_id, t_left, t_right);
+    } else if (t_left.height < t_right.height) {
+        return merge_left_shorter(thread_id, t_left, t_right);
     } else {
-            global_root = NULL;
+        return merge_right_shorter(thread_id, t_left, t_right);
     }
+}
+
+void parallel_merge_local(int thread_id) {
+    ThreadForest *forest = &thread_forests[thread_id];
+    if (forest->count == 0) {
+        // Nothing to do
+    } else if (forest->count == 1) {
+        // Nothing to do
+    } else {
+        Subtree merged = forest->subtrees[0];
+        for (int j = 1; j < forest->count; j++) {
+            merged = merge_two_trees(thread_id, merged, forest->subtrees[j]);
+        }
+        forest->subtrees[0] = merged;
+        forest->count = 1;
+    }
+}
+
+void serial_merge_all(int thread_id) {
+    if (thread_id != 0) return;
+    
+    Subtree all_trees[NR_TASKLETS];
+    int count = 0;
+    
+    for (int i=0; i<NR_TASKLETS; i++) {
+        if (thread_forests[i].count > 0) {
+            all_trees[count++] = thread_forests[i].subtrees[0];
+        }
+    }
+    
+    if (count == 0) {
+        global_root = NULL;
+        global_root_size_var = 0;
+        return;
+    }
+    
+    Subtree final_tree = all_trees[0];
+    for (int i=1; i<count; i++) {
+        final_tree = merge_two_trees(thread_id, final_tree, all_trees[i]);
+    }
+    
+    global_root = final_tree.root;
+    global_root_size_var = final_tree.root_size;
 }
 
 __dma_aligned kvpair_t local_queries[BATCH_SIZE];
@@ -1045,8 +1083,14 @@ int main()
     barrier_wait(&init_barrier);
     if(thread_id == 0) insert_end_time = perfcounter_get();
     
-    // Merge (Serial)
-    merge_forests_serial(thread_id);
+    // Merge
+    // Phase 1: Parallel Merge
+    parallel_merge_local(thread_id);
+    
+    barrier_wait(&init_barrier);
+    
+    // Phase 2: Serial Merge (Thread 0)
+    serial_merge_all(thread_id);
 
     barrier_wait(&init_barrier);
     if (thread_id == 0) end_time = perfcounter_get();   
