@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <vector>
+#include <random>
+#include <unordered_set>
 
 extern "C" {
 #include <dpu.h>
@@ -9,7 +11,7 @@ extern "C" {
 #include "common.h"
 }
 
-#define N 1000000
+#define N (500000 + 2500)
 
 uint64_t n = N;
 kvpair_t query_buffer[N];
@@ -20,14 +22,26 @@ bool compareKvPairs(const kvpair_t &a, const kvpair_t &b) {
 
 void make_query()
 {
-  int seed = 74755;
+  std::mt19937 gen(74755); 
+  std::uniform_int_distribution<int> dist(0, 2147483647); 
+  
+  std::unordered_set<int> unique_keys;
+  unique_keys.reserve(N);
+
   for (int i = 0; i < N; i++) {
-    query_buffer[i].key = seed;
+    int key;
+    do {
+        key = dist(gen);
+    } while (unique_keys.count(key));
+    unique_keys.insert(key);
+
+    query_buffer[i].key = key;
     query_buffer[i].value = i;
-    seed = (seed * 1309 + 13849) & 65535;
   }
 
-  std::sort(query_buffer, query_buffer + N, compareKvPairs);
+  std::shuffle(query_buffer, query_buffer + N, gen);
+  std::sort(query_buffer, query_buffer + 500000, compareKvPairs);
+  std::sort(query_buffer + 500000, query_buffer + N, compareKvPairs);
 }
 
 int main(int argc, char* argv[])
