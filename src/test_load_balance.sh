@@ -16,9 +16,9 @@ for T in 1 2 4 8 16; do
     echo "  NR_TASKLETS = $T"
     echo "========================================="
     
-    dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=$T -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048 \
+    dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=$T -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2560 \
         -o B+Tree.dpu dpu/B+Tree.c
     
-    ./host B+Tree.dpu 2>&1 | grep -E "^(NR_TASKLETS|\+|\| Thread|\|)"
+    ./host B+Tree.dpu 2>&1 | grep -E "^(NR_TASKLETS|\+|\| Thread|\||Insert:)"
     echo ""
 done
