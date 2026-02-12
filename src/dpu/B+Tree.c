@@ -664,7 +664,7 @@ static void distribute_subtrees(int root_height) {
         forest_count[i] = 0;
     }
     
-    distribute_subtrees_recursive(global_root, global_root_size_var, INT32_MIN, INT32_MAX, root_height);
+    distribute_subtrees_recursive(global_root, global_root_size_var, 0, INT32_MAX, root_height);
 }
 
 // Sort subtrees by min_key (insertion sort, called once after distribute)
