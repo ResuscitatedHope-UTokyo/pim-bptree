@@ -1,0 +1,56 @@
+=========================================
+  NR_TASKLETS = 1
+=========================================
+Thread 0: 2500 pairs (range [500000, 502500))
+NR_TASKLETS=1, Total pairs=2500
+
+=========================================
+  NR_TASKLETS = 2
+=========================================
+Thread 1: 1246 pairs (range [501254, 502500))
+Thread 0: 1254 pairs (range [500000, 501254))
+NR_TASKLETS=2, Total pairs=2500
+
+=========================================
+  NR_TASKLETS = 4
+=========================================
+Thread 1: 617 pairs (range [500637, 501254))
+Thread 0: 637 pairs (range [500000, 500637))
+Thread 3: 660 pairs (range [501840, 502500))
+Thread 2: 586 pairs (range [501254, 501840))
+NR_TASKLETS=4, Total pairs=2500
+
+=========================================
+  NR_TASKLETS = 8
+=========================================
+Thread 5: 308 pairs (range [501532, 501840))
+Thread 1: 311 pairs (range [500326, 500637))
+Thread 7: 342 pairs (range [502158, 502500))
+Thread 6: 318 pairs (range [501840, 502158))
+Thread 0: 326 pairs (range [500000, 500326))
+Thread 4: 278 pairs (range [501254, 501532))
+Thread 3: 292 pairs (range [500962, 501254))
+Thread 2: 325 pairs (range [500637, 500962))
+NR_TASKLETS=8, Total pairs=2500
+
+=========================================
+  NR_TASKLETS = 16
+=========================================
+Thread 9: 147 pairs (range [501385, 501532))
+Thread 8: 131 pairs (range [501254, 501385))
+Thread 7: 149 pairs (range [501105, 501254))
+Thread 6: 143 pairs (range [500962, 501105))
+Thread 5: 163 pairs (range [500799, 500962))
+Thread 4: 162 pairs (range [500637, 500799))
+Thread 3: 166 pairs (range [500471, 500637))
+Thread 2: 145 pairs (range [500326, 500471))
+Thread 1: 163 pairs (range [500163, 500326))
+Thread 15: 165 pairs (range [502335, 502500))
+Thread 14: 177 pairs (range [502158, 502335))
+Thread 0: 163 pairs (range [500000, 500163))
+Thread 13: 154 pairs (range [502004, 502158))
+Thread 12: 164 pairs (range [501840, 502004))
+Thread 11: 155 pairs (range [501685, 501840))
+Thread 10: 153 pairs (range [501532, 501685))
+NR_TASKLETS=16, Total pairs=2500
+

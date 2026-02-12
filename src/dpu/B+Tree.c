@@ -93,6 +93,7 @@ typedef struct {
 ThreadLocalData thread_data[NR_TASKLETS];
 ThreadForest thread_forests[NR_TASKLETS];
 KeyType split_keys[NR_TASKLETS + 1];
+int query_partition[NR_TASKLETS + 1];
 __mram_ptr void* global_root = NULL;
 int global_root_size_var = 0;
 
@@ -913,6 +914,21 @@ static void serial_initialization(int thread_id) {
     // Inlined into main to save stack space
 }
 
+// Binary search: find first index in query_buffer[start..end) where key >= target
+static int binary_search_lower(int start, int end, KeyType target) {
+    __dma_aligned kvpair_t kv;
+    while (start < end) {
+        int mid = start + (end - start) / 2;
+        mram_read(&query_buffer[mid], &kv, sizeof(kvpair_t));
+        if (kv.key < target) {
+            start = mid + 1;
+        } else {
+            end = mid;
+        }
+    }
+    return start;
+}
+
 int main()
 {
     int thread_id = me();
@@ -920,7 +936,11 @@ int main()
 
     if (thread_id >= NR_TASKLETS) return 0;
     
-    uint32_t heap_size_per_thread = 3 * 1024 * 1024;// 3MB MRAM per thread
+    // Use fixed total MRAM (48MB) regardless of NR_TASKLETS
+    uint32_t total_mram = 48 * 1024 * 1024; // 48MB total
+    uint32_t heap_size_per_thread = total_mram / NR_TASKLETS;
+    // Align down to NODE_ALIGNMENT
+    heap_size_per_thread = heap_size_per_thread & ~(NODE_ALIGNMENT - 1);
     
     thread_data[thread_id].mram_ptr = mram_heap_start + (thread_id * heap_size_per_thread);
     thread_data[thread_id].mram_end = thread_data[thread_id].mram_ptr + heap_size_per_thread;
@@ -930,6 +950,8 @@ int main()
     
     // 1. Serial Initialization (Thread 0)—— Insert 500,000 keys
     if (thread_id == 0) {
+        // Use ALL threads' MRAM for serial init (Thread 0 needs enough space for 500K entries)
+        thread_data[0].mram_end = mram_heap_start + total_mram;
         int total_queries = 500000; 
         for (int i = 0; i < total_queries; i += BATCH_SIZE) {
             int count = total_queries - i;
@@ -1007,9 +1029,32 @@ int main()
         }
         
         distribute_subtrees(height);
+        
+        // 3. Partition sorted queries by split_keys using binary search
+        int measure_start = 500000;
+        int measure_count = 2500;
+        
+        query_partition[0] = measure_start;
+        query_partition[NR_TASKLETS] = measure_start + measure_count;
+        for (int i = 1; i < NR_TASKLETS; i++) {
+            query_partition[i] = binary_search_lower(measure_start, measure_start + measure_count, split_keys[i]);
+        }
     }
     
     barrier_wait(&init_barrier);
+    
+    // Reset per-thread MRAM allocators for the parallel insert phase.
+    // Serial init used Thread 0's allocator over the whole MRAM; now each thread
+    // gets its own fresh region starting after the serial-init watermark.
+    {
+        __mram_ptr uint8_t* parallel_heap_start = thread_data[0].mram_ptr; // watermark after serial init
+        uint32_t remaining = (uintptr_t)mram_heap_start + total_mram - (uintptr_t)parallel_heap_start;
+        uint32_t per_thread = remaining / NR_TASKLETS;
+        // Align per_thread down to NODE_ALIGNMENT
+        per_thread = per_thread & ~(NODE_ALIGNMENT - 1);
+        thread_data[thread_id].mram_ptr = parallel_heap_start + (thread_id * per_thread);
+        thread_data[thread_id].mram_end = parallel_heap_start + ((thread_id + 1) * per_thread);
+    }
     
     if (thread_id == 0) {
         perfcounter_config(COUNT_CYCLES, false);
@@ -1017,13 +1062,23 @@ int main()
     
     barrier_wait(&init_barrier);
     
-    int measure_start = 500000;
-    int measure_count = 2500;
-    int m_chunk = measure_count / NR_TASKLETS;
-    int m_start = measure_start + thread_id * m_chunk;
-    int m_end = measure_start + (thread_id + 1) * m_chunk;
-    if (thread_id == NR_TASKLETS - 1) m_end = measure_start + measure_count;
+    int m_start = query_partition[thread_id];
+    int m_end = query_partition[thread_id + 1];
     
+    // --- Load Balance Test: print per-thread partition sizes ---
+    printf("Thread %d: %d pairs (range [%d, %d))\n", thread_id, m_end - m_start, m_start, m_end);
+    
+    barrier_wait(&init_barrier);
+    
+    if (thread_id == 0) {
+        int total = 0;
+        for (int i = 0; i < NR_TASKLETS; i++) {
+            total += query_partition[i + 1] - query_partition[i];
+        }
+        printf("NR_TASKLETS=%d, Total pairs=%d\n", NR_TASKLETS, total);
+    }
+    
+#if 0  // === Temporarily disabled: insert + merge ===
     perfcounter_t start_time, end_time, insert_end_time = 0, para_merge_end_time = 0;
     if (thread_id == 0) start_time = perfcounter_get();
     
@@ -1108,6 +1163,7 @@ int main()
         printf("Elapsed time: %f sec\n", total_time);
        
     }
+#endif // === End of temporarily disabled code ===
     
     return 0;
 }
