@@ -1081,7 +1081,7 @@ int main()
             l = UNPACK_ADDR(ln.next);
         }
         
-        split_keys[0] = INT32_MIN;
+        split_keys[0] = 0;  // Keys are non-negative (rand() >= 0)
         split_keys[NR_TASKLETS] = INT32_MAX;
         for(int i=1; i<NR_TASKLETS; i++) split_keys[i] = INT32_MAX;
         
@@ -1164,8 +1164,8 @@ int main()
     
     // Record per-thread partition info
     stat_pairs[thread_id] = m_end - m_start;
-    stat_range_lo[thread_id] = m_start;
-    stat_range_hi[thread_id] = m_end;
+    stat_range_lo[thread_id] = split_keys[thread_id];
+    stat_range_hi[thread_id] = split_keys[thread_id + 1];
     
     barrier_wait(&init_barrier);
     
@@ -1363,16 +1363,15 @@ int main()
         int total_pairs = 0;
         for (int i = 0; i < NR_TASKLETS; i++) total_pairs += stat_pairs[i];
         printf("NR_TASKLETS=%d, Total pairs=%d\n", NR_TASKLETS, total_pairs);
-        printf("+--------+-------+-------------------+-------------+-------------+----------+--------+--------+\n");
-        printf("| Thread | Pairs | Range             | Insert(sec) | P-Merge(sec)| Subtrees | CacheH | CacheM |\n");
-        printf("+--------+-------+-------------------+-------------+-------------+----------+--------+--------+\n");
+        printf("+--------+-------+----------------------------+-------------+-------------+----------+\n");
+        printf("| Thread | Pairs | Range                      | Insert(sec) | P-Merge(sec)| Subtrees |\n");
+        printf("+--------+-------+----------------------------+-------------+-------------+----------+\n");
         for (int i = 0; i < NR_TASKLETS; i++) {
-            printf("| %6d | %5d | [%6d, %6d) | %11f | %11f | %8d | %6d | %6d |\n",
+            printf("| %6d | %5d | [%11d, %11d) | %11f | %11f | %8d |\n",
                    i, stat_pairs[i], stat_range_lo[i], stat_range_hi[i],
-                   stat_insert_time[i], stat_para_merge_time[i], stat_subtrees[i],
-                   stat_cache_hits[i], stat_cache_misses[i]);
+                   stat_insert_time[i], stat_para_merge_time[i], stat_subtrees[i]);
         }
-        printf("+--------+-------+-------------------+-------------+-------------+----------+--------+--------+\n");
+        printf("+--------+-------+----------------------------+-------------+-------------+----------+\n");
         
         // Global timing summary
         float wall_insert = (float)(t_insert_wall_end - wall_clock_insert_start) / (float)CLOCKS_PER_SEC;
