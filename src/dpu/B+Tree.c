@@ -25,8 +25,7 @@ BARRIER_INIT(init_barrier, NR_TASKLETS);
 #define SIZE_MASK 0x7F     //   000001111111
 #define PTR_MASK  (~0x7F) // ...111110000000
 
-#define MAX_SUBTREES 32
-#define MAX_TOTAL_ROOTS (NR_TASKLETS * MAX_SUBTREES)
+#define MAX_SUBTREES 64    // Limited by WRAM capacity (~64KB total)
 #define BATCH_SIZE 16
 typedef int KeyType;
 typedef int ValueType;
@@ -90,12 +89,31 @@ typedef struct {
     int count;
 } ThreadForest;
 
+// Leaf cache for fast-path sorted-key insertion
+typedef struct {
+    __mram_ptr void* leaf_ptr;     // cached leaf address
+    int leaf_size;                  // cached leaf occupancy
+    __mram_ptr void* parent_ptr;    // parent of cached leaf
+    int parent_child_idx;           // index in parent's children[]
+    KeyType max_key;                // max key currently in leaf (for range check)
+    bool valid;                     // is cache valid?
+} LeafCache;
+
 ThreadLocalData thread_data[NR_TASKLETS];
 ThreadForest thread_forests[NR_TASKLETS];
 KeyType split_keys[NR_TASKLETS + 1];
 int query_partition[NR_TASKLETS + 1];
 __mram_ptr void* global_root = NULL;
 int global_root_size_var = 0;
+
+// Per-thread stats for formatted output
+int stat_pairs[NR_TASKLETS];
+int stat_range_lo[NR_TASKLETS];
+int stat_range_hi[NR_TASKLETS];
+float stat_insert_time[NR_TASKLETS];
+int stat_subtrees[NR_TASKLETS];
+int stat_cache_hits[NR_TASKLETS];
+int stat_cache_misses[NR_TASKLETS];
 
 __mram_ptr void *mram_alloc_local(ThreadLocalData *tls, size_t n)
 {
@@ -301,6 +319,41 @@ typedef struct {
     int new_root_size;        // 新子树根的大小
     KeyType split_key;        // 分裂键（新子树的最小键）
 } RootSplitInfo;
+
+// Fast-path leaf insert: try inserting directly into cached leaf (no tree traversal)
+// Returns true if the fast path succeeded, false if caller should do full insert
+static bool leaf_cache_try_insert(int thread_id, LeafCache *cache, KeyType key, ValueType value) {
+    if (!cache->valid) return false;
+    if (cache->leaf_size >= MAX_KEYS) return false;
+    // Key must be > max_key in leaf (sorted ascending keys only)
+    if (key <= cache->max_key) return false;
+
+    ThreadLocalData *tls = &thread_data[thread_id];
+    LeafNode *leaf = &tls->node_buf.leaf;
+    mram_read(cache->leaf_ptr, leaf, sizeof(LeafNode));
+
+    // Append at the end (key > all existing keys)
+    int pos = cache->leaf_size;
+    leaf->keys[pos] = key;
+    leaf->values[pos] = value;
+    mram_write(leaf, cache->leaf_ptr, sizeof(LeafNode));
+
+    int new_size = pos + 1;
+    cache->leaf_size = new_size;
+    cache->max_key = key;
+
+    // Update parent link size
+    if (cache->parent_ptr != NULL) {
+        InternalNode parent;
+        mram_read(cache->parent_ptr, &parent, sizeof(InternalNode));
+        __mram_ptr void* ptr = UNPACK_ADDR(parent.children[cache->parent_child_idx]);
+        parent.children[cache->parent_child_idx] = PACK_LINK(ptr, new_size);
+        mram_write(&parent, cache->parent_ptr, sizeof(InternalNode));
+    }
+    // else: root is the leaf, root_size is updated by caller
+
+    return true;
+}
 
 bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* root_size_ptr, 
                               KeyType key, ValueType value, RootSplitInfo* split_info) {
@@ -600,7 +653,31 @@ static void distribute_subtrees(int root_height) {
     distribute_subtrees_recursive(global_root, global_root_size_var, INT32_MIN, INT32_MAX, root_height);
 }
 
+// Sort subtrees by min_key (insertion sort, called once after distribute)
+static void sort_subtrees(ThreadForest *forest) {
+    int n = forest->count;
+    for (int i = 1; i < n; i++) {
+        Subtree tmp = forest->subtrees[i];
+        int j = i - 1;
+        while (j >= 0 && forest->subtrees[j].min_key > tmp.min_key) {
+            forest->subtrees[j + 1] = forest->subtrees[j];
+            j--;
+        }
+        forest->subtrees[j + 1] = tmp;
+    }
+}
 
+// Insert a new subtree at sorted position (shift right to maintain order)
+static int insert_subtree_sorted(ThreadForest *forest, Subtree *new_tree, int after_idx) {
+    int insert_pos = after_idx + 1;
+    // Shift elements right
+    for (int i = forest->count; i > insert_pos; i--) {
+        forest->subtrees[i] = forest->subtrees[i - 1];
+    }
+    forest->subtrees[insert_pos] = *new_tree;
+    forest->count++;
+    return insert_pos;
+}
 
 // Serial merge removed. New implementation coming.
 
@@ -1065,78 +1142,171 @@ int main()
     int m_start = query_partition[thread_id];
     int m_end = query_partition[thread_id + 1];
     
-    // --- Load Balance Test: print per-thread partition sizes ---
-    printf("Thread %d: %d pairs (range [%d, %d))\n", thread_id, m_end - m_start, m_start, m_end);
+    // Record per-thread partition info
+    stat_pairs[thread_id] = m_end - m_start;
+    stat_range_lo[thread_id] = m_start;
+    stat_range_hi[thread_id] = m_end;
     
     barrier_wait(&init_barrier);
     
+    // --- Per-thread insert timing ---
     if (thread_id == 0) {
-        int total = 0;
-        for (int i = 0; i < NR_TASKLETS; i++) {
-            total += query_partition[i + 1] - query_partition[i];
-        }
-        printf("NR_TASKLETS=%d, Total pairs=%d\n", NR_TASKLETS, total);
+        perfcounter_config(COUNT_CYCLES, false);
     }
+    barrier_wait(&init_barrier);
     
-#if 0  // === Temporarily disabled: insert + merge ===
-    perfcounter_t start_time, end_time, insert_end_time = 0, para_merge_end_time = 0;
-    if (thread_id == 0) start_time = perfcounter_get();
+    // Sort subtrees by min_key for cursor-based lookup
+    sort_subtrees(&thread_forests[thread_id]);
+    int cursor = 0; // Cursor into sorted subtrees (advances as keys increase)
     
+    // Leaf cache for fast-path insertion (skip tree traversal for sorted keys)
+    LeafCache lcache;
+    lcache.valid = false;
+    int cache_hits = 0, cache_misses = 0;
+    
+    perfcounter_t t_insert_start = perfcounter_get();
 
-    // 并行插入 - 使用新算法：子树根分裂时不增加高度，而是产生新子树
+    // 并行插入 - 子树已按min_key排序，利用key有序性用游标查找，摊还O(1)
     for (int i = m_start; i < m_end; i += BATCH_SIZE) {
         int count = m_end - i;
         if (count > BATCH_SIZE) count = BATCH_SIZE;
         // read batch of queries to WRAM
         mram_read(&query_buffer[i], thread_data[thread_id].local_queries, count * sizeof(kvpair_t));
         
+        ThreadForest *forest = &thread_forests[thread_id];
         for (int j = 0; j < count; j++) {
             KeyType key = thread_data[thread_id].local_queries[j].key;
             ValueType value = thread_data[thread_id].local_queries[j].value;
             
-            // Find correct subtree
-            bool inserted = false;
-             for(int k=0; k<thread_forests[thread_id].count; k++) {
-                Subtree *s = &thread_forests[thread_id].subtrees[k];
-                // Check if the key falls within the subtree's range
-                if (key >= s->min_key && key < s->max_key) {
-                    RootSplitInfo split_info;
-                    bptree_insert_thread_ex(thread_id, &s->root, &s->root_size, key, value, &split_info);
-                    
-                    // 如果子树根分裂了，添加新子树到森林（高度不变）
-                    if (split_info.did_split && thread_forests[thread_id].count < MAX_SUBTREES) {
-                        // 更新原子树的范围（只包含左半部分）
-                        KeyType old_max = s->max_key;
-                        s->max_key = split_info.split_key;
-                        
-                        // 添加新子树（右半部分）
-                        int new_idx = thread_forests[thread_id].count++;
-                        thread_forests[thread_id].subtrees[new_idx].root = split_info.new_root;
-                        thread_forests[thread_id].subtrees[new_idx].root_size = split_info.new_root_size;
-                        thread_forests[thread_id].subtrees[new_idx].min_key = split_info.split_key;
-                        thread_forests[thread_id].subtrees[new_idx].max_key = old_max;
-                        thread_forests[thread_id].subtrees[new_idx].height = s->height;  // 高度不变！
-                    }
-                    inserted = true;
-                    break; 
-                } 
+            // Cursor-based subtree lookup: advance cursor while key >= current subtree's max_key
+            int old_cursor = cursor;
+            while (cursor < forest->count && key >= forest->subtrees[cursor].max_key) {
+                cursor++;
             }
-            if (!inserted) {
-                if (thread_forests[thread_id].count < MAX_SUBTREES) {
-                    int idx = thread_forests[thread_id].count++;
-                    thread_forests[thread_id].subtrees[idx].root = NULL;
-                    thread_forests[thread_id].subtrees[idx].root_size = 0;
-                    thread_forests[thread_id].subtrees[idx].min_key = key;
-                    thread_forests[thread_id].subtrees[idx].max_key = key;
-                    thread_forests[thread_id].subtrees[idx].height = 1;
-                    bptree_insert_thread(thread_id, &thread_forests[thread_id].subtrees[idx].root, &thread_forests[thread_id].subtrees[idx].root_size, key, thread_data[thread_id].local_queries[j].value);
+            // Invalidate leaf cache if cursor changed (different subtree)
+            if (cursor != old_cursor) {
+                lcache.valid = false;
+            }
+            
+            if (cursor < forest->count && key >= forest->subtrees[cursor].min_key) {
+                Subtree *s = &forest->subtrees[cursor];
+                
+                // Fast path: try leaf cache insert (1 MRAM read instead of ~5)
+                if (leaf_cache_try_insert(thread_id, &lcache, key, value)) {
+                    // Update subtree's root_size if the cached leaf is the root
+                    if (lcache.parent_ptr == NULL) {
+                        s->root_size = lcache.leaf_size;
+                    }
+                    cache_hits++;
+                    continue;
+                }
+                cache_misses++;
+                
+                RootSplitInfo split_info;
+                bptree_insert_thread_ex(thread_id, &s->root, &s->root_size, key, value, &split_info);
+                
+                // 如果子树根分裂了，在排序位置插入新子树（保持有序）
+                if (split_info.did_split && forest->count < MAX_SUBTREES) {
+                    KeyType old_max = s->max_key;
+                    s->max_key = split_info.split_key;
+                    
+                    Subtree new_sub;
+                    new_sub.root = split_info.new_root;
+                    new_sub.root_size = split_info.new_root_size;
+                    new_sub.min_key = split_info.split_key;
+                    new_sub.max_key = old_max;
+                    new_sub.height = s->height;  // 高度不变
+                    
+                    // Insert right after cursor to maintain sorted order
+                    insert_subtree_sorted(forest, &new_sub, cursor);
+                    // Note: cursor still points to the left half (correct for sorted keys)
+                    lcache.valid = false; // Invalidate cache after split
+                } else if (!split_info.did_split) {
+                    // Populate leaf cache: find rightmost leaf of current subtree
+                    // Since keys are sorted ascending, next key will go to the rightmost leaf
+                    __mram_ptr void* curr_node = s->root;
+                    int curr_node_size = s->root_size;
+                    __mram_ptr void* parent = NULL;
+                    int parent_idx = 0;
+                    int h = s->height;
+                    while (h > 1) {
+                        InternalNode inode;
+                        mram_read(curr_node, &inode, sizeof(InternalNode));
+                        parent = curr_node;
+                        parent_idx = curr_node_size; // rightmost child
+                        NodeLink link = inode.children[curr_node_size];
+                        curr_node = UNPACK_ADDR(link);
+                        curr_node_size = UNPACK_SIZE(link);
+                        h--;
+                    }
+                    lcache.leaf_ptr = curr_node;
+                    lcache.leaf_size = curr_node_size;
+                    lcache.parent_ptr = parent;
+                    lcache.parent_child_idx = parent_idx;
+                    lcache.max_key = key; // just inserted, key is the max
+                    lcache.valid = true;
+                }
+            } else {
+                // Key doesn't fit any existing subtree - create new one at sorted position
+                if (forest->count < MAX_SUBTREES) {
+                    Subtree new_sub;
+                    new_sub.root = NULL;
+                    new_sub.root_size = 0;
+                    new_sub.min_key = key;
+                    new_sub.max_key = key;
+                    new_sub.height = 1;
+                    
+                    // Find sorted insertion position
+                    int pos = (cursor < forest->count) ? cursor : forest->count;
+                    // Insert at pos (shift right)
+                    for (int k = forest->count; k > pos; k--) {
+                        forest->subtrees[k] = forest->subtrees[k - 1];
+                    }
+                    forest->subtrees[pos] = new_sub;
+                    forest->count++;
+                    cursor = pos;
+                    
+                    bptree_insert_thread(thread_id, &forest->subtrees[cursor].root, &forest->subtrees[cursor].root_size, key, value);
+                    lcache.valid = false;
+                    cache_misses++;
                 }
             }
         }
     }
     
+    perfcounter_t t_insert_end = perfcounter_get();
+    
+    // Store per-thread stats for formatted output
+    float t_insert_sec = (float)(t_insert_end - t_insert_start) / (float)CLOCKS_PER_SEC;
+    stat_insert_time[thread_id] = t_insert_sec;
+    stat_subtrees[thread_id] = thread_forests[thread_id].count;
+    stat_cache_hits[thread_id] = cache_hits;
+    stat_cache_misses[thread_id] = cache_misses;
+    
     barrier_wait(&init_barrier);
-    if(thread_id == 0) insert_end_time = perfcounter_get();
+    
+    // Thread 0 prints formatted table
+    if (thread_id == 0) {
+        int total_pairs = 0;
+        for (int i = 0; i < NR_TASKLETS; i++) total_pairs += stat_pairs[i];
+        printf("NR_TASKLETS=%d, Total pairs=%d\n", NR_TASKLETS, total_pairs);
+        printf("+--------+-------+-------------------+-------------+----------+--------+--------+\n");
+        printf("| Thread | Pairs | Range             | Insert(sec) | Subtrees | CacheH | CacheM |\n");
+        printf("+--------+-------+-------------------+-------------+----------+--------+--------+\n");
+        for (int i = 0; i < NR_TASKLETS; i++) {
+            printf("| %6d | %5d | [%6d, %6d) | %11f | %8d | %6d | %6d |\n",
+                   i, stat_pairs[i], stat_range_lo[i], stat_range_hi[i],
+                   stat_insert_time[i], stat_subtrees[i],
+                   stat_cache_hits[i], stat_cache_misses[i]);
+        }
+        printf("+--------+-------+-------------------+-------------+----------+--------+--------+\n");
+    }
+    
+    barrier_wait(&init_barrier);
+
+#if 0  // === Temporarily disabled: merge ===
+    perfcounter_t start_time, end_time, insert_end_time = 0, para_merge_end_time = 0;
+    if (thread_id == 0) start_time = perfcounter_get();
     
     // Merge
     // Phase 1: Parallel Merge

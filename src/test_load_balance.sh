@@ -19,6 +19,6 @@ for T in 1 2 4 8 16; do
     dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=$T -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048 \
         -o B+Tree.dpu dpu/B+Tree.c
     
-    ./host B+Tree.dpu 2>&1 | grep -E "^(Thread|NR_TASKLETS)"
+    ./host B+Tree.dpu 2>&1 | grep -E "^(NR_TASKLETS|\+|\| Thread|\|)"
     echo ""
 done
