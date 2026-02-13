@@ -2,13 +2,9 @@
 set -e
 cd "$(dirname "$0")"
 
-UPMEM_HOME=/home/dushuai/upmem-2025.1.0-Linux-x86_64
-export PATH=$UPMEM_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$UPMEM_HOME/lib:$LD_LIBRARY_PATH
-
 # Compile host once (if needed)
 if [ ! -f host ]; then
-    clang++ -O2 -std=c++17 -I$UPMEM_HOME/include/dpu -o host host.cpp -L$UPMEM_HOME/lib -ldpu
+    clang++ -O2 -std=c++17 -o host host.cpp `dpu-pkg-config --cflags --libs dpu`
 fi
 
 declare -a TIMING_RESULTS
