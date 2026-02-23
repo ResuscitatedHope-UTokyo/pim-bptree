@@ -700,7 +700,6 @@ static int insert_subtree_sorted_mram(int thread_id, Subtree *new_tree, int afte
     return insert_pos;
 }
 
-// Serial merge removed. New implementation coming.
 
 // --- New Merge Algorithm ---
 
@@ -766,27 +765,63 @@ void connect_leaf_list(Subtree left, Subtree right) {
 
 Subtree merge_same_height(int thread_id, Subtree t_left, Subtree t_right) {
     ThreadLocalData *tls = &thread_data[thread_id];
+    int left_size = t_left.root_size;
+    int right_size = t_right.root_size;
+    
+    if (t_left.height > 1) {
+        // Both are internal nodes
+        // Merging requires: left_size keys + 1 separator + right_size keys
+        int merged_keys = left_size + 1 + right_size;
+        if (merged_keys <= MAX_KEYS) {
+            // Can merge into a single internal node — no height increase
+            InternalNode left_node __dma_aligned;
+            InternalNode right_node __dma_aligned;
+            mram_read(t_left.root, &left_node, sizeof(InternalNode));
+            mram_read(t_right.root, &right_node, sizeof(InternalNode));
+            
+            // Insert separator key
+            left_node.keys[left_size] = t_right.min_key;
+            // Copy right's keys and children
+            for (int i = 0; i < right_size; i++) {
+                left_node.keys[left_size + 1 + i] = right_node.keys[i];
+            }
+            for (int i = 0; i <= right_size; i++) {
+                left_node.children[left_size + 1 + i] = right_node.children[i];
+            }
+            
+            mram_write(&left_node, t_left.root, sizeof(InternalNode));
+            
+            Subtree res;
+            res.root = t_left.root;
+            res.root_size = merged_keys;
+            res.min_key = t_left.min_key;
+            res.max_key = t_right.max_key;
+            res.height = t_left.height;
+            res._pad = 0;
+            return res;
+        }
+        // Cannot merge: fall through to create new root
+    }
+    // height==1 (both leaves) or internal nodes that don't fit:
+    // create new root with height+1
     __mram_ptr InternalNode *new_root = create_internal_node(tls);
     
     InternalNode root;
-    memset(&root, 0, sizeof(InternalNode)); // Important to init children to 0/NULL
+    memset(&root, 0, sizeof(InternalNode));
     root.type = INTERNAL_NODE;
-    
-    // Child 0: Left Tree
     root.children[0] = PACK_LINK(t_left.root, t_left.root_size);
-    // Key 0: Right Tree's min key
     root.keys[0] = t_right.min_key;
-    // Child 1: Right Tree
     root.children[1] = PACK_LINK(t_right.root, t_right.root_size);
     
     mram_write(&root, new_root, sizeof(InternalNode));
     
     Subtree res;
     res.root = (__mram_ptr void*)new_root;
-    res.root_size = 1; // 1 key
+    res.root_size = 1;
     res.min_key = t_left.min_key;
     res.max_key = t_right.max_key;
-    res.height = t_left.height + 1; // Height increases by 1
+    res.height = t_left.height + 1;
+    res._pad = 0;
     return res;
 }
 
