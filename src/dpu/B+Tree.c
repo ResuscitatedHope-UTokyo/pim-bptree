@@ -912,13 +912,14 @@ void insert_and_propagate(int thread_id,
 }
 
 Subtree merge_left_shorter(int thread_id, Subtree t_left, Subtree t_right) {
-    // height(t_left) < height(t_right)
-    // Simplest fix: just return t_right (lose t_left for now, will fix properly later)
+    // TODO: Implement correct merge when heights differ
+    // For now, return fallback (data loss but no crash)
     return t_right;
 }
 
 Subtree merge_right_shorter(int thread_id, Subtree t_left, Subtree t_right) {
-    // TEMPORARY: just return t_left without merging
+    // TODO: Implement correct merge when heights differ
+    // For now, return fallback (data loss but no crash)
     return t_left;
 }
 
