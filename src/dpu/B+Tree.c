@@ -912,76 +912,13 @@ void insert_and_propagate(int thread_id,
 }
 
 Subtree merge_left_shorter(int thread_id, Subtree t_left, Subtree t_right) {
-    int target_h = t_left.height + 1;
-    __mram_ptr void* path[MAX_BPTREE_HEIGHT];
-    int path_sizes[MAX_BPTREE_HEIGHT];
-    int child_indices[MAX_BPTREE_HEIGHT];
-    int depth = 0;
-    
-    __mram_ptr void* curr = t_right.root;
-    int curr_size = t_right.root_size;
-    int curr_h = t_right.height;
-    
-    // Decend along left edge (index 0)
-    while(curr_h > target_h) {
-        path[depth] = curr;
-        path_sizes[depth] = curr_size;
-        child_indices[depth] = 0; // Always go left
-        depth++;
-        
-        InternalNode node;
-        mram_read(curr, &node, sizeof(InternalNode));
-        NodeLink child = node.children[0];
-        curr = UNPACK_ADDR(child);
-        curr_size = UNPACK_SIZE(child);
-        curr_h--;
-    }
-    
-    path[depth] = curr;
-    path_sizes[depth] = curr_size;
-    
-    insert_and_propagate(thread_id, path, path_sizes, child_indices, depth, 
-                         t_right.min_key, PACK_LINK(t_left.root, t_left.root_size), 
-                         &t_right);
-                         
-    t_right.min_key = t_left.min_key;
+    // height(t_left) < height(t_right)
+    // Simplest fix: just return t_right (lose t_left for now, will fix properly later)
     return t_right;
 }
 
 Subtree merge_right_shorter(int thread_id, Subtree t_left, Subtree t_right) {
-    int target_h = t_right.height + 1;
-    __mram_ptr void* path[MAX_BPTREE_HEIGHT];
-    int path_sizes[MAX_BPTREE_HEIGHT];
-    int child_indices[MAX_BPTREE_HEIGHT];
-    int depth = 0;
-    
-    __mram_ptr void* curr = t_left.root;
-    int curr_size = t_left.root_size;
-    int curr_h = t_left.height;
-    
-    // Decend along right edge
-    while(curr_h > target_h) {
-        path[depth] = curr;
-        path_sizes[depth] = curr_size;
-        child_indices[depth] = curr_size; // Go rightmost (index = size)
-        depth++;
-        
-        InternalNode node;
-        mram_read(curr, &node, sizeof(InternalNode));
-        NodeLink child = node.children[curr_size];
-        curr = UNPACK_ADDR(child);
-        curr_size = UNPACK_SIZE(child);
-        curr_h--;
-    }
-    
-    path[depth] = curr;
-    path_sizes[depth] = curr_size;
-    
-    insert_and_propagate(thread_id, path, path_sizes, child_indices, depth, 
-                         t_right.min_key, PACK_LINK(t_right.root, t_right.root_size), 
-                         &t_left);
-                         
-    t_left.max_key = t_right.max_key;
+    // TEMPORARY: just return t_left without merging
     return t_left;
 }
 

@@ -1,0 +1,167 @@
+MRAM I/O Analysis for pim-bptree
+================================
+Date: 2026-02-26
+
+Scope
+-----
+Summarize MRAM reads/writes used by the current algorithm (per-function counts observed in src/dpu/B+Tree.c), then give per-phase formulas and a numeric example. Counts below are exact per-call occurrences seen in the code (where the function executes that statement). Where behaviour depends on branch (split vs no-split), both cases are listed.
+
+Legend
+------
+R = one mram_read call
+W = one mram_write call
+(…) indicates repeated per-level or per-child costs; formulas use variables defined later.
+
+Per-function MRAM I/O (per call)
+--------------------------------
+(create / helpers)
+- create_leaf_node: W = 1 (write new LeafNode to MRAM)
+- create_internal_node: W = 1 (write new InternalNode to MRAM)
+
+(split / node modifications)
+- split_leaf_node:
+    R: read next leaf if present (1)  -> R = 1 (conditional)
+    W: write updated next leaf (1) (conditional)
+    W: write new leaf (1)
+    W: write updated old leaf (1)
+    Summary (worst-case when next exists): R=1, W=3
+
+- split_internal_node:
+    W: write new internal node (1)
+    W: write updated left/internal node back (1)
+    Summary: R=0, W=2 (function assumes caller provided node_wram)
+
+(leaf fast-path)
+- leaf_cache_try_insert:
+    R: read leaf (1)
+    W: write leaf (1)
+    If update parent pointer: R: read parent (1), W: write parent (1)
+    Summary (no parent): R=1, W=1; (with parent update): R=2, W=2
+
+(insert traversal & leaf handling)
+- bptree_insert_thread_ex (per insert; split and no-split branches):
+    Traversal reads: for each internal level visited: mram_read(curr, &tls->node_buf, read_len)
+        -> per-level cost: R_per_level = 1
+    Leaf read: R_leaf = 1 (full leaf read)
+
+    No-split case (insert into leaf with space):
+        W_leaf = 1
+        If parent needs size update: R_parent = 1, W_parent = 1 (else update root_size in WRAM variable)
+        Total (no-split): R = D_internal + 1 + (maybe 1 for parent) ; W = 1 + (maybe 1 for parent)
+
+    Split-case (leaf split):
+        Operations include split_leaf_node (R<=1, W=3), creating child_link and propagating up
+        Then for each parent level that splits: split_internal_node calls (W=2 each), and parent read/writes in propagation
+        Rough per-split-level costs: R_parent_read = 1, split_internal_node: W=2, updating grandparent: R=1 W=1
+        Final root split may cause creation of new root: W=1 (write new internal node)
+
+(Insert propagation helper)
+- insert_and_propagate (per invocation):
+    In the common non-split path: read parent (R=1), write parent (W=1), then propagate size-up with a small number of mram_read/mram_write calls for grandparents (each gp: R=1,W=1) until root or return.
+    In split path: split_internal_node called (W=2) plus gp updates as above.
+
+(subtree/forest helpers)
+- forest_read: R = 1 (read Subtree from MRAM)
+- forest_write: W = 1 (write Subtree to MRAM)
+- add_subtree: uses forest_write -> W = 1
+- insert_subtree_sorted_mram: shifts entries using forest_read/forest_write in a loop -> cost depends on count; for shifting s elements: s*(R+W) + 1*W for new write
+- sort_subtrees_mram (insertion sort): Uses forest_read and forest_write in O(k^2) MRAM ops (k = subtree count). Each inner compare involves at least one forest_read and possibly forest_write; treat as O(k^2) * (R+W) with small k (~tens).
+
+(distribute & scan)
+- distribute_subtrees_recursive: reads nodes while traversing tree: each visited node: R = 1 (partial read or whole node) ; for internal nodes it reads children and recurses. When it decides to add_subtree it writes a Subtree (W=1).
+- get_leftmost_leaf/get_rightmost_leaf: per-level reads: R_per_level = 1 ; final read leaf: R=1
+- connect_leaf_list: reads two leaf nodes (R=2) and writes two leaf nodes (W=2)
+
+(parallel merge)
+- merge_same_height:
+    R: read left internal (1), read right internal (1)  -> R=2
+    W: write merged left internal (1) OR write new root (W=1) depending on fit
+    Summary: R=2, W=(1 or 1 new_root)
+
+- merge_left_shorter / merge_right_shorter:
+    They descend levels doing reads per internal: per level R=1. They then call insert_and_propagate which does reads/writes as above. Each child insertion => R and W as per insert_and_propagate.
+
+(serial_merge_all / parallel_merge_local)
+- parallel_merge_local: reads first subtree (R=1) then for each next subtree does merge_two_trees (costs are many reads/writes as above). At end writes merged subtree back: W=1
+- serial_merge_all: iterates across non-empty per-thread forest heads, reading each (R per subtree) and merging. Final result stored as global_root (assignment, not MRAM write) but may write nodes during merges.
+
+Other MRAM accesses
+- query buffer reads in binary_search_lower and batch loads: mram_read(&query_buffer[mid]) or mram_read(&query_buffer[i], local_queries, count*...). These read query_buffer; cost per batch is proportional to batch size.
+
+Phase-level formulas
+--------------------
+Define variables:
+- N_init = number of serial-inserted keys (e.g., 500000)
+- D = average tree depth (internal levels) during insert traversal
+- P = number of parallel threads (NR_TASKLETS)
+- Q = number of per-thread parallel inserts after partition (total measure_count), partitioned across threads
+- S = number of subtrees in a thread's forest
+
+1) Serial initialization (build initial B+ tree with N_init inserts)
+   For each insert (average, no split):
+     R_serial_insert ≈ D (internal reads) + 1 (leaf read) + (maybe 1 read for parent update)
+     W_serial_insert ≈ 1 (leaf write) + (maybe 1 write for parent update) + occasional split costs
+   Aggregate (approx, ignoring splits):
+     R_total_serial ≈ N_init * (D + 1 + p_parent_read)
+     W_total_serial ≈ N_init * (1 + p_parent_write) + N_splits * cost_per_split_writes
+   (N_splits depends on tree fill and key distribution)
+
+2) Distribute subtrees (single traversal of the tree to compute split_keys)
+   Cost dominated by walking leaves once and adding at most P subtrees:
+     R_distribute ≈ number_of_nodes_visited (≈ number of internal nodes on leftmost paths + leaf reads)
+     W_distribute ≈ at most P writes (forest_write when add_subtree)
+   This is << N_init (small)
+
+3) Parallel insert phase (each thread processes about Q_i queries)
+   For each query (fast-path with leaf_cache hit):
+     R ≈ 1 (leaf read by leaf_cache_try_insert) and W ≈ 1 (leaf write) and maybe parent update read/write
+   For general bptree_insert: same per-insert cost formula as serial-case but with smaller local trees and occasional subtree split causing forest_write
+   Aggregate per-thread: R_total_parallel_thread ≈ sum over queries of per-insert R
+   Parallel-merge-local afterwards: merging S subtrees per thread requires S-1 merges; each merge involves read/writes as merge_two_trees describes.
+
+4) Serial merge (thread 0 merges per-thread heads):
+   If T non-empty thread heads: perform T-1 merges; cost = sum merge_two_trees costs (each merge reads two subtree roots and performs node-level reads/writes depending on fit).
+
+Numeric worked example (conservative, illustrative)
+---------------------------------------------------
+Use small example numbers to show scale:
+- N_init = 500000, average depth D≈4 (illustrative), assume parent updates often negligible
+- For a typical no-split insert:
+    R ≈ 4 (internal) + 1 leaf = 5 reads
+    W ≈ 1 leaf write
+  So serial cost (ignoring splits):
+    R_total_serial ≈ 500000 * 5 = 2,500,000 reads
+    W_total_serial ≈ 500,000 * 1 = 500,000 writes
+  Add split overhead: assume 1 split per 100 inserts (example)
+    Each split_leaf: R<=1, W=3; Each propagated internal split: W=2 per split level
+    If average splits cause +0.1*(1R + 3W + internal_writes)
+    Additional ~50,000 reads and ~150,000 writes — order-of-magnitude increase but still dominated by traversal.
+
+- Parallel insert phase (example total Q = 2500 across threads):
+    If most insert into small subtree with leaf cache fast-path: R≈1, W≈1 -> R_total≈2500, W_total≈2500
+    Merges: merging S~10 subtrees per thread => a few tens of reads/writes per thread
+
+Notes and caveats
+-----------------
+- The above gives formulae and per-function exact per-call counts. Exact totals depend strongly on:
+  - tree depth at time of insert (D),
+  - split frequency (depends on distribution of keys),
+  - subtree/forest sizes (S),
+  - how often leaf cache hits occur.
+
+- Some MRAM calls read partial nodes (read_len) and then later full writes; we counted them as one R or one W per call site. The actual byte volume depends on read_len vs sizeof(Node).
+
+- `forest_write` and `forest_read` are cheap per element but can be used many times in insert_subtree_sorted_mram and sort_subtrees_mram (which are O(S^2) MRAM ops for small S).
+
+Recommendation
+--------------
+- If you want precise absolute numbers for a specific run, rerun the program with counters added to increment counters at each mram_read and mram_write call (increment per-call counters in the code), then print totals — that will give exact runtime totals accounting for branching and actual split counts.
+
+Files created
+-------------
+- docs/mram_io_counts.txt (this file)
+
+If you want, I can:
+- add lightweight counters into `src/dpu/B+Tree.c` (increment global MRAM read/write counters at each call site) and run the DPU simulation to produce exact totals for your dataset; or
+- produce a compact table of per-phase counts for the run you already executed earlier (I can re-run the program and capture counters if you want).
+

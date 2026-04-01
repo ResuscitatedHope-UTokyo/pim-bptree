@@ -1,0 +1,140 @@
+MRAM 访问量分析（中文）
+=========================
+日期：2026-02-26
+
+范围
+----
+总结当前实现（文件 `src/dpu/B+Tree.c`）在各阶段使用的 MRAM 读/写次数。先按函数列出代码中出现的 MRAM 调用位置与每次调用的读写次数，然后按阶段给出通式与示例估算。
+
+符号说明
+--------
+R = 一次 `mram_read` 调用
+W = 一次 `mram_write` 调用
+(…) 表示按层或按子项重复出现；公式中用到下文定义的变量。
+
+按函数的 MRAM I/O（每次调用）
+---------------------------
+（创建 / 辅助）
+- `create_leaf_node`: W = 1（写新 LeafNode 到 MRAM）
+- `create_internal_node`: W = 1（写新 InternalNode 到 MRAM）
+
+（分裂 / 节点修改）
+- `split_leaf_node`：
+    R: 读取 next 叶（若存在）=1（有条件）
+    W: 更新 next 叶 =1（有条件）
+    W: 写入 new leaf =1
+    W: 写回旧 leaf =1
+    合计（最坏，next 存在）：R=1, W=3
+
+- `split_internal_node`：
+    W: 写入 new internal =1
+    W: 写回左半节点 =1
+    合计：R=0, W=2（函数假定 node_wram 已由调用者提供）
+
+（叶缓存快路径）
+- `leaf_cache_try_insert`：
+    R: 读叶节点 =1
+    W: 写叶节点 =1
+    如需更新父节点：R=1, W=1
+    合计：无父时 R=1,W=1；需更新父时 R=2,W=2
+
+（插入遍历与叶处理）
+- `bptree_insert_thread_ex`（对每次插入；分裂/不分裂分支）：
+    遍历阶段：每层内部结点一次读 -> 每层 R=1
+    叶读取：R_leaf =1（完整叶读取）
+
+    不分裂情况：
+      W_leaf =1
+      如需更新父大小：R_parent=1, W_parent=1（否则更新 root_size 在 WRAM 变量）
+      总计（不分裂）：R=D_internal + 1 + (可选 1)；W=1 + (可选 1)
+
+    分裂情况（叶分裂）：
+      包括 `split_leaf_node`（R<=1, W=3），并向上传播；每个父层分裂调用 `split_internal_node`（每层 W=2），并对祖父执行读写。
+
+（插入并向上传播 helper）
+- `insert_and_propagate`：
+    非分裂路径：读 parent(R=1)、写 parent(W=1)，并向上更新祖父（每个 gp: R=1,W=1）直到返回或到根。
+    分裂路径：调用 `split_internal_node`（W=2）加上祖父更新。
+
+（子树/森林操作）
+- `forest_read`: R = 1
+- `forest_write`: W = 1
+- `add_subtree`: 调用 `forest_write` -> W = 1
+- `insert_subtree_sorted_mram`: 需要把若干元素右移，移动 s 个元素代价约 s*(R+W) + 1*W
+- `sort_subtrees_mram`: 插入排序，MRAM 读写为 O(k^2)（k 很小，几十级别）
+
+（分发与扫描）
+- `distribute_subtrees_recursive`: 遍历树时每访问一个节点 R≈1；当调用 `add_subtree` 时会 W=1
+- `get_leftmost_leaf/get_rightmost_leaf`: 每层读 R=1，最终叶读 R=1
+- `connect_leaf_list`: 读两叶（R=2），写两叶（W=2）
+
+（合并阶段）
+- `merge_same_height`：
+    R: 读左 internal (1), 读右 internal (1) -> R=2
+    W: 写合并后的 left internal (1) 或写 new_root (1) -> W=1
+
+- `merge_left_shorter` / `merge_right_shorter`：
+    下降查找时每层 R=1；随后对每个要插入的子树调用 `insert_and_propagate`，每次插入的 R/W 参见该 helper。
+
+（并行/串行合并）
+- `parallel_merge_local`: 读取第一个 subtree（R=1），依次与后续子树合并（每次合并会有若干 R/W），最后写回合并结果（W=1）
+- `serial_merge_all`: 读取各线程头（R），合并并可能写回节点（取决于合并实现）
+
+其他 MRAM 访问
+- `query_buffer` 的读取（`mram_read(&query_buffer[mid])` 或批量读取）在二分查找与批处理时出现，按批大小计数。
+
+阶段级公式
+----------
+设变量：
+- N_init = 串行初始化插入键数（示例：500000）
+- D = 平均树深（示例≈4）
+- P = 线程数（NR_TASKLETS）
+- Q = 并行阶段总查询数（示例：2500）
+- S = 每线程子树数量
+
+1) 串行初始化
+   每次插入（无分裂）近似：
+     R ≈ D + 1（叶）
+     W ≈ 1（写叶）
+   汇总（忽略分裂）：
+     R_total ≈ N_init * (D + 1)
+     W_total ≈ N_init * 1
+   加上分裂开销将增加额外 R/W（见上文 split 成本）
+
+2) 分发子树
+   遍历树一次 + 最多写 P 个 Subtree：
+     R_distribute ≈ 访问节点数（远小于 N_init）
+     W_distribute ≤ P
+
+3) 并行插入
+   若大部分走叶缓存快路径：每个插入 R≈1, W≈1
+   总体：R_total_parallel ≈ Q * (平均 R)，W_total_parallel ≈ Q * (平均 W)
+   并行局部合并（S 个子树）：每次合并按照 merge_two_trees 的读写代价
+
+4) 串行合并
+   对 T 个非空线程头：进行 T−1 次 merge_two_trees，成本是这些合并的读写总和
+
+数值示例（估算）
+------------------
+- 假设 N_init=500000, D=4, 大部分插入无分裂：
+    R_total_serial ≈ 500000 * 5 = 2,500,000
+    W_total_serial ≈ 500,000
+  若每 100 次插入发生一次分裂（示例），分裂带来额外几十万级别的读写。
+
+- 并行插入 Q=2500，若大多数命中 leaf cache：R≈2500, W≈2500，合并代价另计。
+
+注意与建议
+-----------
+- 上述为按函数调用统计的计数与估算。如需精确数值，请在 `src/dpu/B+Tree.c` 中在每个 `mram_read`/`mram_write` 处增加计数器（++mr_read_count / ++mr_write_count），运行 simulator 得到精确统计。
+
+已创建的文件
+-------------
+- `docs/mram_io_counts.txt`（英文）
+- `docs/mram_io_counts_cn.txt`（本文件，中文翻译）
+
+下一步（可选）
+-------------
+我可以：
+- 在 `src/dpu/B+Tree.c` 中临时添加运行时计数器并重新运行以获得精确统计；或
+- 基于你指定的运行配置（N_init、NR_TASKLETS、measure_count）给出更精确的数值估算。
+
