@@ -194,29 +194,35 @@ static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mr
     
     if (pos >= split_val) {
         // New key goes to Right Node
+        // Copy keys from [split_val, leaf_current_size], inserting new key at pos
         int r_idx = 0;
-        for (int k = split_val; k < pos; k++) {
+        for (int k = split_val; k < leaf_current_size; k++) {
+            if (k == pos) {
+                // Insert new key
+                new_leaf_wram.keys[r_idx] = key;
+                new_leaf_wram.values[r_idx] = value;
+                r_idx++;
+            }
+            // Copy existing key
             new_leaf_wram.keys[r_idx] = leaf_wram->keys[k];
             new_leaf_wram.values[r_idx] = leaf_wram->values[k];
             r_idx++;
         }
-        // Insert new key
-        new_leaf_wram.keys[r_idx] = key;
-        new_leaf_wram.values[r_idx] = value;
-        r_idx++;
-        for (int k = pos; k < leaf_current_size; k++) {
-            new_leaf_wram.keys[r_idx] = leaf_wram->keys[k];
-            new_leaf_wram.values[r_idx] = leaf_wram->values[k];
+        // If new key was after all existing keys
+        if (pos == leaf_current_size) {
+            new_leaf_wram.keys[r_idx] = key;
+            new_leaf_wram.values[r_idx] = value;
             r_idx++;
         }
     } else {
         // New key goes to Left Node
+        // Copy keys from position [split_val, total_keys) to new leaf
         for (int k = 0; k < right_count; k++) {
-             new_leaf_wram.keys[k] = leaf_wram->keys[split_val - 1 + k];
-             new_leaf_wram.values[k] = leaf_wram->values[split_val - 1 + k];
+             new_leaf_wram.keys[k] = leaf_wram->keys[split_val + k];  // Fixed: split_val (not split_val - 1)
+             new_leaf_wram.values[k] = leaf_wram->values[split_val + k];
         }
         
-        // Update Left Node
+        // Update Left Node: shift keys in [pos, split_val-1) to the right, insert new key at pos
         for (int k = split_val - 1; k > pos; k--) {
             leaf_wram->keys[k] = leaf_wram->keys[k-1];
             leaf_wram->values[k] = leaf_wram->values[k-1];
@@ -243,6 +249,40 @@ static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mr
     *new_leaf_out = new_leaf_addr;
     *new_leaf_size_out = new_leaf_size;
     *old_leaf_new_size_out = old_leaf_new_size;
+    
+    // Verify correctness before writing
+    int verify_old_ok = 1, verify_new_ok = 1;
+    for (int i = 0; i < old_leaf_new_size - 1; i++) {
+        if (leaf_wram->keys[i] >= leaf_wram->keys[i+1]) {
+            verify_old_ok = 0;
+            break;
+        }
+    }
+    for (int i = 0; i < new_leaf_size - 1; i++) {
+        if (new_leaf_wram.keys[i] >= new_leaf_wram.keys[i+1]) {
+            verify_new_ok = 0;
+            break;
+        }
+    }
+    
+    if (!verify_old_ok) {
+        printf("ERROR: split_leaf_node created unsorted old leaf! old_size=%d, pos=%d, key=%d\n",
+               old_leaf_new_size, pos, key);
+        printf("  Old leaf keys: ");
+        for (int i = 0; i < old_leaf_new_size; i++) printf("%d ", leaf_wram->keys[i]);
+        printf("\n");
+    }
+    if (!verify_new_ok) {
+        printf("ERROR: split_leaf_node created unsorted new leaf! new_size=%d, pos=%d, key=%d\n",
+               new_leaf_size, pos, key);
+        printf("  Original leaf_current_size=%d, total_keys=%d, split_val=%d\n", 
+               leaf_current_size, total_keys, split_val);
+        printf("  Original leaf: ");
+        for (int i = 0; i < leaf_current_size; i++) printf("%d ", leaf_wram->keys[i]);
+        printf("\n  New leaf keys: ");
+        for (int i = 0; i < new_leaf_size; i++) printf("%d ", new_leaf_wram.keys[i]);
+        printf("\n");
+    }
     
     mram_write(&new_leaf_wram, new_leaf_addr, sizeof(LeafNode));
     mram_write(leaf_wram, leaf_addr, sizeof(LeafNode));
