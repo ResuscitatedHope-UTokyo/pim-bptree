@@ -45,4 +45,15 @@ typedef struct {
   uint32_t root_leaf_checked;          // 1 if leaf is also root
 } LeafOccupancyVerification;
 
+// Test 5: Tree height balance verification (all leaf paths same length)
+typedef struct {
+  uint32_t total_leaves_checked;       // Total leaves scanned from root
+  int expected_height;                 // Height from root to leaf
+  int min_leaf_depth;                  // Minimum path length to leaf
+  int max_leaf_depth;                  // Maximum path length to leaf
+  uint32_t unbalanced_leaves;          // Count of leaves at non-standard height
+  int first_imbalanced_leaf_depth;     // Depth of first non-standard leaf
+  uint32_t height_balanced;            // 1 if all leaves at same depth, 0 otherwise
+} TreeHeightVerification;
+
 #endif /* _COMMON_H_ */

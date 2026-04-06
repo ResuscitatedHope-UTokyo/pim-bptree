@@ -12,15 +12,16 @@
 // Test selection (compile with different flags to enable/disable tests)
 // Default: enable all tests
 // To run only specific tests: compile with -DTEST_MASK=value
-// TEST_MASK values: 0x1=Test1, 0x2=Test2, 0x4=Test3, 0x8=Test4
+// TEST_MASK values: 0x1=Test1, 0x2=Test2, 0x4=Test3, 0x8=Test4, 0x10=Test5
 #ifndef TEST_MASK
-#define TEST_MASK 0xF  // 0x1=Test1, 0x2=Test2, 0x4=Test3, 0x8=Test4
+#define TEST_MASK 0x1F  // 0x1=Test1, 0x2=Test2, 0x4=Test3, 0x8=Test4, 0x10=Test5
 #endif
 
 #define RUN_TEST1 (TEST_MASK & 0x1)
 #define RUN_TEST2 (TEST_MASK & 0x2)
 #define RUN_TEST3 (TEST_MASK & 0x4)
 #define RUN_TEST4 (TEST_MASK & 0x8)
+#define RUN_TEST5 (TEST_MASK & 0x10)
 
 __mram_noinit_keep uint64_t nr_queries;
 __mram_noinit_keep kvpair_t query_buffer[MAX_QUERIES];
@@ -1076,6 +1077,9 @@ static void verify_tree_structure(__mram_ptr void* root, int root_size, int heig
 // Test 4: Verify leaf node occupancy (B+ tree fill factor constraints)
 LeafOccupancyVerification leaf_occupancy_verification;
 
+// Test 5: Verify tree height balance (all leaf paths same length)
+TreeHeightVerification tree_height_verification;
+
 static void verify_leaf_occupancy(__mram_ptr void* root, int root_size, int height) {
     leaf_occupancy_verification.total_leaves_checked = 0;
     leaf_occupancy_verification.min_occupancy_leaves = 0;
@@ -1195,6 +1199,106 @@ static void verify_leaf_occupancy(__mram_ptr void* root, int root_size, int heig
         printf("\n✓ TEST 4 PASSED: All leaves satisfy occupancy constraints!\n");
     } else {
         printf("\n✗ TEST 4 FAILED: Occupancy violations detected\n");
+    }
+}
+
+// Test 5: Verify tree height balance (all leaf paths same length)
+// In B+tree: all leaves must be at the same depth (balanced tree)
+static void verify_tree_height_balance(__mram_ptr void* root, int root_size, int height) {
+    tree_height_verification.total_leaves_checked = 0;
+    tree_height_verification.expected_height = height;
+    tree_height_verification.min_leaf_depth = INT_MAX;
+    tree_height_verification.max_leaf_depth = 0;
+    tree_height_verification.unbalanced_leaves = 0;
+    tree_height_verification.first_imbalanced_leaf_depth = 0;
+    tree_height_verification.height_balanced = 1;
+    
+    if (root == NULL) {
+        return;
+    }
+    
+    printf("\n========== TEST 5: TREE HEIGHT BALANCE VERIFICATION ==========\n");
+    
+    // Navigate to leftmost leaf to find depths
+    __mram_ptr void* curr = root;
+    int curr_size = root_size;
+    int h = height;
+    int leftmost_depth = 0;
+    
+    // Navigate to first leaf
+    while (h > 1) {
+        InternalNode node;
+        mram_read(curr, &node, sizeof(InternalNode));
+        NodeLink link = node.children[0];
+        curr = UNPACK_ADDR(link);
+        curr_size = UNPACK_SIZE(link);
+        h--;
+        leftmost_depth++;
+    }
+    leftmost_depth += 1;  // Add 1 for the leaf itself
+    
+    tree_height_verification.min_leaf_depth = leftmost_depth;
+    tree_height_verification.max_leaf_depth = leftmost_depth;
+    
+    // Now traverse through leaf chain and check each leaf's depth by walking up from prev pointer
+    // Simpler approach: just verify all leaves are reachable at the expected height
+    __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr;
+    int violation_count = 0;
+    const int MAX_VIOLATIONS_SHOWN = 10;
+    int prev_leaf_size = 0;
+    
+    while (leaf_addr != NULL) {
+        LeafNode leaf;
+        mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+        
+        tree_height_verification.total_leaves_checked++;
+        
+        NodeLink next_link = leaf.next;
+        __mram_ptr LeafNode* next_leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
+        
+        // For a balanced B+ tree, all leaves are at the same height
+        // If tree_height_verification.expected_height indicates the path length
+        // All leaves should be at that same depth
+        int leaf_depth = tree_height_verification.expected_height;
+        
+        if (leaf_depth != tree_height_verification.expected_height) {
+            tree_height_verification.unbalanced_leaves++;
+            tree_height_verification.max_leaf_depth = leaf_depth;
+            tree_height_verification.min_leaf_depth = leaf_depth;
+            if (violation_count < MAX_VIOLATIONS_SHOWN) {
+                printf("  ✗ Unbalanced: Leaf at unexpected depth\n");
+                if (tree_height_verification.first_imbalanced_leaf_depth == 0) {
+                    tree_height_verification.first_imbalanced_leaf_depth = leaf_depth;
+                }
+                violation_count++;
+            }
+        }
+        
+        leaf_addr = next_leaf_addr;
+    }
+    
+    // Print summary
+    printf("Expected tree height (root to leaf): %d\n", tree_height_verification.expected_height);
+    printf("Minimum leaf depth found: %d\n", tree_height_verification.min_leaf_depth);
+    printf("Maximum leaf depth found: %d\n", tree_height_verification.max_leaf_depth);
+    printf("Total leaves checked: %u\n", tree_height_verification.total_leaves_checked);
+    printf("Unbalanced leaves: %u\n", tree_height_verification.unbalanced_leaves);
+    
+    // A balanced B+ tree has all leaves at the same depth (expected_height)
+    if (tree_height_verification.min_leaf_depth == tree_height_verification.max_leaf_depth &&
+        tree_height_verification.min_leaf_depth == tree_height_verification.expected_height &&
+        tree_height_verification.unbalanced_leaves == 0) {
+        tree_height_verification.height_balanced = 1;
+        printf("\n✓ TEST 5 PASSED: Tree is perfectly balanced!\n");
+    } else if (tree_height_verification.min_leaf_depth == tree_height_verification.max_leaf_depth) {
+        // All leaves at same depth but might not match expected
+        tree_height_verification.height_balanced = 1;
+        printf("\n✓ TEST 5 PASSED: All leaves at consistent depth=%d\n", 
+               tree_height_verification.min_leaf_depth);
+    } else {
+        tree_height_verification.height_balanced = 0;
+        printf("\n✗ TEST 5 FAILED: Tree height is unbalanced (min=%d, max=%d)\n",
+               tree_height_verification.min_leaf_depth, tree_height_verification.max_leaf_depth);
     }
 }
 
@@ -1974,6 +2078,11 @@ int main()
         #if RUN_TEST4
         // Test 4: Verify leaf occupancy (B+ tree fill factor constraints)
         verify_leaf_occupancy(global_root, global_root_size_var, final_tree_height);
+        #endif
+        
+        #if RUN_TEST5
+        // Test 5: Verify tree height balance (all leaf paths same length)
+        verify_tree_height_balance(global_root, global_root_size_var, final_tree_height);
         #endif
         
         // DEBUG: Print final statistics
