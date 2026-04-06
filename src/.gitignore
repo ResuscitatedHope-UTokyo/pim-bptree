@@ -1,2 +1,11 @@
+# Compiled binaries
 *.dpu
 host
+verify
+stage_verify
+
+# Compiler outputs
+*.map
+*.o
+*.elf
+*.a
