@@ -11,15 +11,16 @@
 
 // Test selection (compile with different flags to enable/disable tests)
 // Default: enable all tests
-// To run only Test 3: compile with -DTEST_MASK=0x4
-// To run only Test 1+2: compile with -DTEST_MASK=0x3
+// To run only specific tests: compile with -DTEST_MASK=value
+// TEST_MASK values: 0x1=Test1, 0x2=Test2, 0x4=Test3, 0x8=Test4
 #ifndef TEST_MASK
-#define TEST_MASK 0x7  // 0x1=Test1, 0x2=Test2, 0x4=Test3
+#define TEST_MASK 0xF  // 0x1=Test1, 0x2=Test2, 0x4=Test3, 0x8=Test4
 #endif
 
 #define RUN_TEST1 (TEST_MASK & 0x1)
 #define RUN_TEST2 (TEST_MASK & 0x2)
 #define RUN_TEST3 (TEST_MASK & 0x4)
+#define RUN_TEST4 (TEST_MASK & 0x8)
 
 __mram_noinit_keep uint64_t nr_queries;
 __mram_noinit_keep kvpair_t query_buffer[MAX_QUERIES];
@@ -1072,7 +1073,103 @@ static void verify_tree_structure(__mram_ptr void* root, int root_size, int heig
     }
 }
 
+// Test 4: Verify leaf node occupancy (B+ tree fill factor constraints)
+LeafOccupancyVerification leaf_occupancy_verification;
 
+static void verify_leaf_occupancy(__mram_ptr void* root, int root_size, int height) {
+    leaf_occupancy_verification.total_leaves_checked = 0;
+    leaf_occupancy_verification.min_occupancy_leaves = 0;
+    leaf_occupancy_verification.max_occupancy_leaves = 0;
+    leaf_occupancy_verification.first_violation_leaf_size = 0;
+    leaf_occupancy_verification.root_leaf_checked = 0;
+    
+    // In B+ tree with MAX_KEYS=30 (order m=31):
+    // - Leaf nodes can have at most 30 keys
+    // - Non-root leaf nodes must have at least ⌈(m-1)/2⌉ = 15 keys
+    // - Root can have as few as 1 key
+    leaf_occupancy_verification.max_allowed_keys = MAX_KEYS;
+    leaf_occupancy_verification.min_allowed_keys = (MAX_KEYS + 1) / 2;  // ⌈MAX_KEYS/2⌉ = 15
+    
+    if (root == NULL) {
+        return;
+    }
+    
+    printf("\n========== TEST 4: LEAF OCCUPANCY VERIFICATION ==========\n");
+    
+    // Navigate to leftmost leaf
+    __mram_ptr void* curr = root;
+    int curr_size = root_size;
+    int h = height;
+    int is_root_leaf = (height == 1) ? 1 : 0;
+    
+    while (h > 1) {
+        InternalNode node;
+        mram_read(curr, &node, sizeof(InternalNode));
+        NodeLink link = node.children[0];
+        curr = UNPACK_ADDR(link);
+        curr_size = UNPACK_SIZE(link);
+        h--;
+    }
+    
+    // Traverse leaf chain and verify occupancy
+    __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr;
+    int leaf_index = 0;
+    int violations_shown = 0;
+    const int MAX_VIOLATIONS_SHOWN = 10;
+    
+    while (leaf_addr != NULL) {
+        LeafNode leaf;
+        mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+        int leaf_size = UNPACK_SIZE(leaf.next);
+        if (leaf_size == 0) leaf_size = 1;  // Leaf with at least 1 key
+        
+        leaf_occupancy_verification.total_leaves_checked++;
+        
+        // Check occupancy constraints
+        int is_root = (is_root_leaf && leaf_index == 0) ? 1 : 0;
+        int min_keys = is_root ? 1 : leaf_occupancy_verification.min_allowed_keys;
+        
+        if (leaf_size < min_keys) {
+            leaf_occupancy_verification.min_occupancy_leaves++;
+            if (violations_shown < MAX_VIOLATIONS_SHOWN) {
+                printf("  ✗ Leaf %d: UNDERFULL (size=%d, min=%d)\n", 
+                       leaf_index, leaf_size, min_keys);
+                if (leaf_occupancy_verification.first_violation_leaf_size == 0) {
+                    leaf_occupancy_verification.first_violation_leaf_size = leaf_size;
+                }
+                violations_shown++;
+            }
+        } else if (leaf_size > leaf_occupancy_verification.max_allowed_keys) {
+            leaf_occupancy_verification.max_occupancy_leaves++;
+            if (violations_shown < MAX_VIOLATIONS_SHOWN) {
+                printf("  ✗ Leaf %d: OVERFULL (size=%d, max=%d)\n",
+                       leaf_index, leaf_size, leaf_occupancy_verification.max_allowed_keys);
+                if (leaf_occupancy_verification.first_violation_leaf_size == 0) {
+                    leaf_occupancy_verification.first_violation_leaf_size = leaf_size;
+                }
+                violations_shown++;
+            }
+        }
+        
+        NodeLink next_link = leaf.next;
+        leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
+        leaf_index++;
+    }
+    
+    printf("Tree order: m = %d (MAX_KEYS + 1)\n", MAX_KEYS + 1);
+    printf("Max keys per leaf: %d\n", leaf_occupancy_verification.max_allowed_keys);
+    printf("Min keys per non-root leaf: %d\n", leaf_occupancy_verification.min_allowed_keys);
+    printf("Total leaves checked: %u\n", leaf_occupancy_verification.total_leaves_checked);
+    printf("Underfull leaves (< min): %u\n", leaf_occupancy_verification.min_occupancy_leaves);
+    printf("Overfull leaves (> max): %u\n", leaf_occupancy_verification.max_occupancy_leaves);
+    
+    if (leaf_occupancy_verification.min_occupancy_leaves == 0 && 
+        leaf_occupancy_verification.max_occupancy_leaves == 0) {
+        printf("\n✓ TEST 4 PASSED: All leaves satisfy occupancy constraints!\n");
+    } else {
+        printf("\n✗ TEST 4 FAILED: Occupancy violations detected\n");
+    }
+}
 
 // Test 2: Verify that leaf nodes are ordered correctly
 // In B+tree: keys within leaf are strictly ascending, between leaves max(leaf_i) <= min(leaf_i+1)
@@ -1845,6 +1942,11 @@ int main()
         #if RUN_TEST2
         // Test 2: Verify leaf ordering (without repair, just diagnosis)
         verify_leaf_ordering(global_root, global_root_size_var, final_tree_height);
+        #endif
+        
+        #if RUN_TEST4
+        // Test 4: Verify leaf occupancy (B+ tree fill factor constraints)
+        verify_leaf_occupancy(global_root, global_root_size_var, final_tree_height);
         #endif
         
         // DEBUG: Print final statistics

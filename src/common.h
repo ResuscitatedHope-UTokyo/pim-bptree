@@ -34,4 +34,15 @@ typedef struct {
   uint32_t tree_connected;             // 1 if all nodes connected from root
 } TreeStructureVerification;
 
+// Test 4: Leaf node occupancy verification (B+ tree fill factor)
+typedef struct {
+  uint32_t total_leaves_checked;       // Total leaves scanned
+  uint32_t min_occupancy_leaves;       // Leaves below minimum occupancy
+  uint32_t max_occupancy_leaves;       // Leaves exceeding maximum occupancy
+  int first_violation_leaf_size;       // Size of first violating leaf
+  int min_allowed_keys;                // Minimum allowed keys per leaf (except root)
+  int max_allowed_keys;                // Maximum allowed keys per leaf
+  uint32_t root_leaf_checked;          // 1 if leaf is also root
+} LeafOccupancyVerification;
+
 #endif /* _COMMON_H_ */
