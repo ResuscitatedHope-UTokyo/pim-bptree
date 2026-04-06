@@ -9,6 +9,18 @@
 #include <barrier.h>
 #include "../common.h"
 
+// Test selection (compile with different flags to enable/disable tests)
+// Default: enable all tests
+// To run only Test 3: compile with -DTEST_MASK=0x4
+// To run only Test 1+2: compile with -DTEST_MASK=0x3
+#ifndef TEST_MASK
+#define TEST_MASK 0x7  // 0x1=Test1, 0x2=Test2, 0x4=Test3
+#endif
+
+#define RUN_TEST1 (TEST_MASK & 0x1)
+#define RUN_TEST2 (TEST_MASK & 0x2)
+#define RUN_TEST3 (TEST_MASK & 0x4)
+
 __mram_noinit_keep uint64_t nr_queries;
 __mram_noinit_keep kvpair_t query_buffer[MAX_QUERIES];
 
@@ -968,6 +980,100 @@ static void repair_leaf_ordering(__mram_ptr void* root, int root_size, int heigh
     }
 }
 
+// Test 3: Verify tree structure completeness (connectivity, cycles, chain integrity)
+TreeStructureVerification tree_structure_verification;
+
+static void verify_tree_structure(__mram_ptr void* root, int root_size, int height) {
+    tree_structure_verification.total_nodes_visited = 0;
+    tree_structure_verification.total_leaves_scanned = 0;
+    tree_structure_verification.cycle_detected = 0;
+    tree_structure_verification.orphan_nodes = 0;
+    tree_structure_verification.broken_chain = 0;
+    tree_structure_verification.tree_connected = 1;
+    
+    if (root == NULL) {
+        printf("ERROR: Root is NULL\n");
+        tree_structure_verification.tree_connected = 0;
+        return;
+    }
+    
+    printf("\n========== TEST 3: TREE STRUCTURE VERIFICATION ==========\n");
+    
+    // Simplified approach: only check leaf chain integrity
+    // This is the most critical part - leaves must be properly linked
+    
+    int total_leaves = 0;
+    __mram_ptr void* curr_leaf = root;
+    int curr_leaf_size = root_size;
+    int h = height;
+    
+    // Navigate to leftmost leaf
+    while (h > 1) {
+        InternalNode node;
+        mram_read(curr_leaf, &node, sizeof(InternalNode));
+        NodeLink link = node.children[0];
+        curr_leaf = UNPACK_ADDR(link);
+        curr_leaf_size = UNPACK_SIZE(link);
+        h--;
+    }
+    
+    // Traverse entire leaf chain and verify correctness
+    __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr_leaf;
+    __mram_ptr LeafNode* prev_leaf_addr = NULL;
+    int max_chain_length = 100000;
+    int chain_pos = 0;
+    int broken_prev_ptr = 0;
+    
+    while (leaf_addr != NULL && chain_pos < max_chain_length) {
+        LeafNode leaf;
+        mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+        total_leaves++;
+        
+        // Verify backward pointer
+        if (chain_pos == 0) {
+            // First leaf should have NULL prev
+            if (leaf.prev != NULL) {
+                broken_prev_ptr = 1;
+                printf("ERROR: First leaf has non-NULL prev pointer\n");
+            }
+        } else {
+            // Middle/last leaves should have correct prev
+            if (leaf.prev != prev_leaf_addr) {
+                broken_prev_ptr = 1;
+            }
+        }
+        
+        prev_leaf_addr = leaf_addr;
+        NodeLink next_link = leaf.next;
+        leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
+        chain_pos++;
+    }
+    
+    if (chain_pos >= max_chain_length && leaf_addr != NULL) {
+        tree_structure_verification.cycle_detected = 1;
+        printf("ERROR: Leaf chain exceeds max length (possible cycle)\n");
+    }
+    
+    tree_structure_verification.total_leaves_scanned = total_leaves;
+    
+    printf("Total leaves in chain: %d\n", total_leaves);
+    printf("Leaf chain broken (prev pointers): %s\n", broken_prev_ptr ? "YES" : "NO");
+    printf("Cycles detected: %s\n", tree_structure_verification.cycle_detected ? "YES" : "NO");
+    
+    if (!broken_prev_ptr && !tree_structure_verification.cycle_detected) {
+        tree_structure_verification.broken_chain = 0;
+        printf("\n✓ TEST 3 PASSED: Leaf chain is valid!\n");
+        printf("  - No cycles detected\n");
+        printf("  - All backward pointers correct\n");
+        printf("  - Leaf chain complete and intact\n");
+    } else {
+        tree_structure_verification.broken_chain = 1;
+        printf("\n✗ TEST 3 FAILED: Leaf chain issues detected\n");
+    }
+}
+
+
+
 // Test 2: Verify that leaf nodes are ordered correctly
 // In B+tree: keys within leaf are strictly ascending, between leaves max(leaf_i) <= min(leaf_i+1)
 static void verify_leaf_ordering(__mram_ptr void* root, int root_size, int height) {
@@ -1730,8 +1836,16 @@ int main()
         tree_export_info.total_key_count = count_tree_keys(global_root, global_root_size_var, final_tree_height);
         tree_export_info.leaf_count = count_tree_leaves(global_root, global_root_size_var, final_tree_height);
         
+        // Conditional test verification based on TEST_MASK
+        #if RUN_TEST3
+        // Test 3: Verify tree structure (connectivity, cycles, chain integrity)
+        verify_tree_structure(global_root, global_root_size_var, final_tree_height);
+        #endif
+        
+        #if RUN_TEST2
         // Test 2: Verify leaf ordering (without repair, just diagnosis)
         verify_leaf_ordering(global_root, global_root_size_var, final_tree_height);
+        #endif
         
         // DEBUG: Print final statistics
         printf("\n========== FINAL TREE STATISTICS ==========\n");

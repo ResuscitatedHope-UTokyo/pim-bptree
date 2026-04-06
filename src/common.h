@@ -24,4 +24,14 @@ typedef struct {
   uint8_t violation_type;              // 1=within leaf, 2=between leaves
 } LeafOrderVerification;
 
+// Test 3: Tree structure completeness verification
+typedef struct {
+  uint32_t total_nodes_visited;        // Total nodes in tree
+  uint32_t total_leaves_scanned;       // Leaves reached via chain
+  uint32_t cycle_detected;             // 1 if cycle found, 0 otherwise
+  uint32_t orphan_nodes;               // Nodes unreachable from root
+  uint32_t broken_chain;               // 0 if leaf chain is complete
+  uint32_t tree_connected;             // 1 if all nodes connected from root
+} TreeStructureVerification;
+
 #endif /* _COMMON_H_ */
