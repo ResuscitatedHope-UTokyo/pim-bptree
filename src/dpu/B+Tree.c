@@ -198,15 +198,16 @@ static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mr
         int r_idx = 0;
         for (int k = split_val; k < leaf_current_size; k++) {
             if (k == pos) {
-                // Insert new key
+                // Insert new key (replaces keys[pos])
                 new_leaf_wram.keys[r_idx] = key;
                 new_leaf_wram.values[r_idx] = value;
                 r_idx++;
+            } else {
+                // Copy existing key (only if it's not being replaced)
+                new_leaf_wram.keys[r_idx] = leaf_wram->keys[k];
+                new_leaf_wram.values[r_idx] = leaf_wram->values[k];
+                r_idx++;
             }
-            // Copy existing key
-            new_leaf_wram.keys[r_idx] = leaf_wram->keys[k];
-            new_leaf_wram.values[r_idx] = leaf_wram->values[k];
-            r_idx++;
         }
         // If new key was after all existing keys
         if (pos == leaf_current_size) {
@@ -383,36 +384,9 @@ typedef struct {
 // Fast-path leaf insert: try inserting directly into cached leaf (no tree traversal)
 // Returns true if the fast path succeeded, false if caller should do full insert
 static bool leaf_cache_try_insert(int thread_id, LeafCache *cache, KeyType key, ValueType value) {
-    if (!cache->valid) return false;
-    if (cache->leaf_size >= MAX_KEYS) return false;
-    // Key must be > max_key in leaf (sorted ascending keys only)
-    if (key <= cache->max_key) return false;
-
-    ThreadLocalData *tls = &thread_data[thread_id];
-    LeafNode *leaf = &tls->node_buf.leaf;
-    mram_read(cache->leaf_ptr, leaf, sizeof(LeafNode));
-
-    // Append at the end (key > all existing keys)
-    int pos = cache->leaf_size;
-    leaf->keys[pos] = key;
-    leaf->values[pos] = value;
-    mram_write(leaf, cache->leaf_ptr, sizeof(LeafNode));
-
-    int new_size = pos + 1;
-    cache->leaf_size = new_size;
-    cache->max_key = key;
-
-    // Update parent link size
-    if (cache->parent_ptr != NULL) {
-        InternalNode parent;
-        mram_read(cache->parent_ptr, &parent, sizeof(InternalNode));
-        __mram_ptr void* ptr = UNPACK_ADDR(parent.children[cache->parent_child_idx]);
-        parent.children[cache->parent_child_idx] = PACK_LINK(ptr, new_size);
-        mram_write(&parent, cache->parent_ptr, sizeof(InternalNode));
-    }
-    // else: root is the leaf, root_size is updated by caller
-
-    return true;
+    // Leaf cache optimization requires careful synchronization in parallel environment
+    // Disabled to ensure correctness - normal tree traversal in bptree_insert_thread_ex is sufficient
+    return false;
 }
 
 bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* root_size_ptr, 
@@ -799,18 +773,47 @@ void connect_leaf_list(Subtree left, Subtree right) {
         LeafNode l_node;
         mram_read(l_info.addr, &l_node, sizeof(LeafNode));
         
+        // Verify left leaf is sorted before connecting
+        int l_ok = 1;
+        for (int i = 0; i < l_info.size - 1; i++) {
+            if (l_node.keys[i] >= l_node.keys[i+1]) {
+                l_ok = 0;
+                printf("  connect_leaf_list WARNING: Left leaf unsorted at pos %d: %d >= %d\n",
+                       i, l_node.keys[i], l_node.keys[i+1]);
+                break;
+            }
+        }
+        
+        // Verify right leaf is sorted before connecting
+        LeafNode r_node;
+        mram_read(r_info.addr, &r_node, sizeof(LeafNode));
+        
+        int r_ok = 1;
+        for (int i = 0; i < r_info.size - 1; i++) {
+            if (r_node.keys[i] >= r_node.keys[i+1]) {
+                r_ok = 0;
+                printf("  connect_leaf_list WARNING: Right leaf unsorted at pos %d: %d >= %d\n",
+                       i, r_node.keys[i], r_node.keys[i+1]);
+                break;
+            }
+        }
+        
+        // Verify proper ordering across leaves
+        if (l_ok && r_ok && l_node.keys[l_info.size - 1] > r_node.keys[0]) {
+            printf("  connect_leaf_list WARNING: Left max=%d > Right min=%d (ORDER VIOLATION!)\n",
+                   l_node.keys[l_info.size - 1], r_node.keys[0]);
+        }
+        
         // Link left -> right
         l_node.next = PACK_LINK(r_info.addr, r_info.size);
         mram_write(&l_node, l_info.addr, sizeof(LeafNode));
-        
-        LeafNode r_node;
-        mram_read(r_info.addr, &r_node, sizeof(LeafNode));
         
         // Link right -> prev = left
         r_node.prev = l_info.addr;
         mram_write(&r_node, r_info.addr, sizeof(LeafNode));
     }
 }
+
 
 // Function to compute tree height
 static int compute_tree_height(__mram_ptr void* root, int root_size) {
@@ -1112,6 +1115,36 @@ Subtree merge_same_height(int thread_id, Subtree t_left, Subtree t_right) {
     root.keys[0] = t_right.min_key;
     root.children[1] = PACK_LINK(t_right.root, t_right.root_size);
     
+    // DEBUG: If both are leaves (height==1), verify they are properly ordered before writing
+    if (t_left.height == 1) {
+        LeafNode left_leaf, right_leaf;
+        mram_read((__mram_ptr LeafNode*)t_left.root, &left_leaf, sizeof(LeafNode));
+        mram_read((__mram_ptr LeafNode*)t_right.root, &right_leaf, sizeof(LeafNode));
+        
+        int left_ok = 1, right_ok = 1;
+        for (int i = 0; i < t_left.root_size - 1; i++) {
+            if (left_leaf.keys[i] >= left_leaf.keys[i+1]) {
+                left_ok = 0;
+                printf("  merge_same_height: LEFT LEAF UNSORTED at pos %d: %d >= %d\n",
+                       i, left_leaf.keys[i], left_leaf.keys[i+1]);
+                break;
+            }
+        }
+        for (int i = 0; i < t_right.root_size - 1; i++) {
+            if (right_leaf.keys[i] >= right_leaf.keys[i+1]) {
+                right_ok = 0;
+                printf("  merge_same_height: RIGHT LEAF UNSORTED at pos %d: %d >= %d\n",
+                       i, right_leaf.keys[i], right_leaf.keys[i+1]);
+                break;
+            }
+        }
+        
+        if (left_ok && right_ok && left_leaf.keys[t_left.root_size - 1] > right_leaf.keys[0]) {
+            printf("  merge_same_height: BETWEEN-LEAF ORDER VIOLATION: left_max=%d > right_min=%d\n",
+                   left_leaf.keys[t_left.root_size - 1], right_leaf.keys[0]);
+        }
+    }
+    
     mram_write(&root, new_root, sizeof(InternalNode));
     
     Subtree res;
@@ -1290,11 +1323,16 @@ void parallel_merge_local(int thread_id) {
     forest_read(thread_id, 0, &merged);
     for (int j = 1; j < count; j++) {
         forest_read(thread_id, j, &next);
+        
+        printf("[Thread %d] Merging subtree %d with %d (heights: %d + %d, sizes: %d + %d)\n",
+               thread_id, 0, j, merged.height, next.height, merged.root_size, next.root_size);
+        
         merged = merge_two_trees(thread_id, merged, next);
     }
     forest_write(thread_id, 0, &merged);
     forest_count[thread_id] = 1;
 }
+
 
 __dma_aligned kvpair_t local_queries[BATCH_SIZE];
 
@@ -1515,9 +1553,17 @@ int main()
             if (cursor < my_forest_count && key >= cur_subtree.min_key) {
                 // Fast path: try leaf cache insert (1 MRAM read instead of ~5)
                 if (leaf_cache_try_insert(thread_id, &lcache, key, value)) {
-                    // Update subtree's root_size if the cached leaf is the root
+                    // Update parent/root with new leaf size
                     if (lcache.parent_ptr == NULL) {
+                        // Cached leaf is the root
                         cur_subtree.root_size = lcache.leaf_size;
+                    } else {
+                        // Update parent link with new size
+                        InternalNode parent;
+                        mram_read(lcache.parent_ptr, &parent, sizeof(InternalNode));
+                        __mram_ptr void* ptr = UNPACK_ADDR(parent.children[lcache.parent_child_idx]);
+                        parent.children[lcache.parent_child_idx] = PACK_LINK(ptr, lcache.leaf_size);
+                        mram_write(&parent, lcache.parent_ptr, sizeof(InternalNode));
                     }
                     cache_hits++;
                     continue;
