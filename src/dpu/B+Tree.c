@@ -118,6 +118,9 @@ int global_root_size_var = 0;
 // Tree export info for host verification
 TreeExportInfo tree_export_info;
 
+// Leaf order verification results (Test 2)
+LeafOrderVerification leaf_order_verification;
+
 // Global to track final tree height after merge
 int final_tree_height = 0;
 
@@ -861,6 +864,164 @@ static uint32_t count_tree_keys(__mram_ptr void* root, int root_size, int height
     return (uint32_t)nr_queries;
 }
 
+// Test 2动作2: 在发现违反后进行就地冒泡排序修复
+static void repair_leaf_ordering(__mram_ptr void* root, int root_size, int height) {
+    if (root == NULL) {
+        return;
+    }
+    
+    // Navigate to leftmost leaf
+    __mram_ptr void* curr = root;
+    int curr_size = root_size;
+    int h = height;
+    while (h > 1) {
+        InternalNode node;
+        mram_read(curr, &node, sizeof(InternalNode));
+        NodeLink link = node.children[0];
+        curr = UNPACK_ADDR(link);
+        curr_size = UNPACK_SIZE(link);
+        h--;
+    }
+    
+    uint32_t repaired_count = 0;
+    
+    __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr;
+    int leaf_size = curr_size;
+    
+    while (leaf_addr != NULL) {
+        LeafNode leaf;
+        mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+        
+        // Simple bubble sort for this leaf
+        bool swapped = true;
+        while (swapped) {
+            swapped = false;
+            for (int i = 0; i < leaf_size - 1; i++) {
+                if (leaf.keys[i] > leaf.keys[i + 1]) {
+                    // Swap keys and values
+                    int temp_key = leaf.keys[i];
+                    int temp_val = leaf.values[i];
+                    leaf.keys[i] = leaf.keys[i + 1];
+                    leaf.values[i] = leaf.values[i + 1];
+                    leaf.keys[i + 1] = temp_key;
+                    leaf.values[i + 1] = temp_val;
+                    swapped = true;
+                    repaired_count++;
+                }
+            }
+        }
+        
+        // Write back the repaired leaf
+        mram_write(&leaf, leaf_addr, sizeof(LeafNode));
+        
+        // Move to next leaf
+        NodeLink next_link = leaf.next;
+        leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
+        leaf_size = UNPACK_SIZE(next_link);
+    }
+    
+    if (repaired_count > 0) {
+        printf("Repaired %u key swaps across all leaves\n", repaired_count);
+    }
+}
+
+// Test 2: Verify that leaf nodes are ordered correctly
+// In B+tree: keys within leaf are strictly ascending, between leaves max(leaf_i) <= min(leaf_i+1)
+static void verify_leaf_ordering(__mram_ptr void* root, int root_size, int height) {
+    leaf_order_verification.total_leaf_pairs_checked = 0;
+    leaf_order_verification.within_leaf_violations = 0;
+    leaf_order_verification.between_leaf_violations = 0;
+    leaf_order_verification.first_violation_key = 0;
+    leaf_order_verification.violation_type = 0;
+    
+    if (root == NULL) {
+        return;
+    }
+    
+    // Navigate to leftmost leaf
+    __mram_ptr void* curr = root;
+    int curr_size = root_size;
+    int h = height;
+    while (h > 1) {
+        InternalNode node;
+        mram_read(curr, &node, sizeof(InternalNode));
+        NodeLink link = node.children[0];
+        curr = UNPACK_ADDR(link);
+        curr_size = UNPACK_SIZE(link);
+        h--;
+    }
+    
+    // Traverse leaf chain and verify ordering
+    __mram_ptr LeafNode* prev_leaf = NULL;
+    int prev_size = 0;
+    int prev_max_key = -2147483648;
+    uint32_t leaf_index = 0;
+    int debug_violations_shown = 0;
+    const int DEBUG_MAX_VIOLATIONS = 20;
+    
+    __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr;
+    int leaf_size = curr_size;
+    
+    printf("\n========== TEST 2: LEAF ORDERING VERIFICATION ==========\n");
+    
+    while (leaf_addr != NULL) {
+        LeafNode leaf;
+        mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+        
+        int leaf_min_key = leaf.keys[0];
+        int leaf_max_key = leaf.keys[leaf_size - 1];
+        
+        // Check if keys within this leaf are STRICTLY sorted (no duplicates, and ascending)
+        for (int i = 0; i < leaf_size - 1; i++) {
+            if (leaf.keys[i] >= leaf.keys[i + 1]) {
+                if (leaf_order_verification.violation_type == 0) {
+                    leaf_order_verification.first_violation_key = leaf.keys[i];
+                    leaf_order_verification.violation_type = 1;  // Within leaf violation
+                }
+                leaf_order_verification.within_leaf_violations++;
+                
+                if (debug_violations_shown < DEBUG_MAX_VIOLATIONS) {
+                    printf("  ✗ Leaf %u violation: pos[%d]=%d >= pos[%d]=%d\n",
+                           leaf_index, i, leaf.keys[i], i+1, leaf.keys[i+1]);
+                    printf("    Leaf addr=0x%lx, size=%d, keys=[%d...%d]\n",
+                           (unsigned long)leaf_addr, leaf_size, leaf_min_key, leaf_max_key);
+                    debug_violations_shown++;
+                }
+            }
+        }
+        
+        // Check ordering between consecutive leaves: max(leaf_i) <= min(leaf_i+1)
+        if (prev_leaf != NULL) {
+            if (prev_max_key > leaf_min_key) {
+                if (leaf_order_verification.violation_type == 0) {
+                    leaf_order_verification.first_violation_key = leaf_min_key;
+                    leaf_order_verification.violation_type = 2;  // Between leaves violation
+                }
+                leaf_order_verification.between_leaf_violations++;
+            }
+            leaf_order_verification.total_leaf_pairs_checked++;
+        }
+        
+        // Update previous leaf info
+        prev_leaf = leaf_addr;
+        prev_size = leaf_size;
+        prev_max_key = leaf_max_key;
+        leaf_index++;
+        
+        // Move to next leaf
+        NodeLink next_link = leaf.next;
+        leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
+        leaf_size = UNPACK_SIZE(next_link);
+    }
+    
+    printf("Total leaves traversed: %u\n", leaf_index);
+    printf("Within-leaf violations: %u\n", leaf_order_verification.within_leaf_violations);
+    printf("Between-leaf violations: %u\n", leaf_order_verification.between_leaf_violations);
+    printf("================================================\n\n");
+}
+
+
+
 Subtree merge_same_height(int thread_id, Subtree t_left, Subtree t_right) {
     ThreadLocalData *tls = &thread_data[thread_id];
     int left_size = t_left.root_size;
@@ -1483,6 +1644,9 @@ int main()
         tree_export_info.total_key_count = count_tree_keys(global_root, global_root_size_var, final_tree_height);
         tree_export_info.leaf_count = count_tree_leaves(global_root, global_root_size_var, final_tree_height);
         
+        // Test 2: Verify leaf ordering (without repair, just diagnosis)
+        verify_leaf_ordering(global_root, global_root_size_var, final_tree_height);
+        
         // DEBUG: Print final statistics
         printf("\n========== FINAL TREE STATISTICS ==========\n");
         printf("Root Address: 0x%lx\n", (unsigned long)global_root);
@@ -1500,6 +1664,25 @@ int main()
                    (uint32_t)nr_queries - tree_export_info.total_key_count);
         }
         printf("========== END STATISTICS ==========\n\n");
+        
+        // Test 2 Results
+        printf("\n========== TEST 2: LEAF NODE ORDERING ==========\n");
+        printf("Total leaf pairs checked: %u\n", leaf_order_verification.total_leaf_pairs_checked);
+        printf("Within-leaf violations: %u\n", leaf_order_verification.within_leaf_violations);
+        printf("Between-leaf violations: %u\n", leaf_order_verification.between_leaf_violations);
+        
+        if (leaf_order_verification.within_leaf_violations == 0 && 
+            leaf_order_verification.between_leaf_violations == 0) {
+            printf("✓ ALL LEAVES PROPERLY ORDERED!\n");
+            printf("Test 2: PASSED\n");
+        } else {
+            printf("✗ LEAF ORDERING VIOLATIONS DETECTED\n");
+            printf("First violation key: %d, Type: %s\n", 
+                   leaf_order_verification.first_violation_key,
+                   leaf_order_verification.violation_type == 1 ? "Within leaf" : "Between leaves");
+            printf("Test 2: FAILED\n");
+        }
+        printf("=========================================\n\n");
     }
     
     barrier_wait(&init_barrier);
