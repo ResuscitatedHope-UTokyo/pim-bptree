@@ -34,7 +34,7 @@ make -C "$SCRIPT_DIR" host >/dev/null
 for t in "${TASKLETS[@]}"; do
     RUN_LOG="$TMP_DIR/run_${t}.log"
 
-    bash "$SCRIPT_DIR/build_tests.sh" all "$t" >"$TMP_DIR/build_${t}.log" 2>&1
+    bash "$SCRIPT_DIR/build_tests.sh" test5 "$t" >"$TMP_DIR/build_${t}.log" 2>&1
     "$SCRIPT_DIR/host" "$SCRIPT_DIR/B+Tree.dpu" >"$RUN_LOG" 2>&1
 
     FOUND_TASKLETS=$(grep -m1 -E '^NR_TASKLETS=' "$RUN_LOG" | sed -E 's/^NR_TASKLETS=([0-9]+),.*/\1/')
