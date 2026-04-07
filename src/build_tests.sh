@@ -11,31 +11,31 @@ test_config=$1
 case $test_config in
     "all")
         echo "=== Building with all tests (TEST_MASK=0x1F) ==="
-        dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=16 -Wl,--no-gc-sections \
+        dpu-upmem-dpurte-clang -Os -DNR_TASKLETS=16 -Wl,--no-gc-sections \
             -DSTACK_SIZE_DEFAULT=2048 -o B+Tree.dpu dpu/B+Tree.c
         echo "✓ Built B+Tree.dpu with all tests (1-5)"
         ;;
     "test1-2")
         echo "=== Building with Tests 1+2 (TEST_MASK=0x3) ==="
-        dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=16 -DTEST_MASK=0x3 \
+        dpu-upmem-dpurte-clang -Os -DNR_TASKLETS=16 -DTEST_MASK=0x3 \
             -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048 -o B+Tree.dpu dpu/B+Tree.c
         echo "✓ Built B+Tree.dpu with Tests 1+2"
         ;;
     "test3")
         echo "=== Building with Test 3 only (TEST_MASK=0x4) ==="
-        dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=16 -DTEST_MASK=0x4 \
+        dpu-upmem-dpurte-clang -Os -DNR_TASKLETS=16 -DTEST_MASK=0x4 \
             -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048 -o B+Tree.dpu dpu/B+Tree.c
         echo "✓ Built B+Tree.dpu with Test 3 only"
         ;;
     "test4")
         echo "=== Building with Test 4 only (TEST_MASK=0x8) ==="
-        dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=16 -DTEST_MASK=0x8 \
+        dpu-upmem-dpurte-clang -Os -DNR_TASKLETS=16 -DTEST_MASK=0x8 \
             -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048 -o B+Tree.dpu dpu/B+Tree.c
         echo "✓ Built B+Tree.dpu with Test 4 only"
         ;;
     "test5")
         echo "=== Building with Test 5 only (TEST_MASK=0x10) ==="
-        dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=16 -DTEST_MASK=0x10 \
+        dpu-upmem-dpurte-clang -Os -DNR_TASKLETS=16 -DTEST_MASK=0x10 \
             -Wl,--no-gc-sections -DSTACK_SIZE_DEFAULT=2048 -o B+Tree.dpu dpu/B+Tree.c
         echo "✓ Built B+Tree.dpu with Test 5 only"
         ;;

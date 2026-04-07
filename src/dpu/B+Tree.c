@@ -60,7 +60,7 @@ typedef uint32_t NodeLink;
 
 struct __dma_aligned LeafNode {
     NodeType type; // 4
-    // int num_keys;  <-- REMOVED
+    int num_keys; // 4 (explicit leaf occupancy)
     KeyType keys[MAX_KEYS]; // 4 * 30 = 120
     ValueType values[MAX_KEYS]; // 4 * 30 = 120
     NodeLink next; // 4 (Embedded size of next leaf)
@@ -171,8 +171,9 @@ __mram_ptr void *mram_alloc_local(ThreadLocalData *tls, size_t n)
 
 __mram_ptr LeafNode* create_leaf_node(ThreadLocalData *tls) {
     LeafNode node __dma_aligned;
+    memset(&node, 0, sizeof(LeafNode));
     node.type = LEAF_NODE;
-    // node.num_keys = 0;  <-- REMOVED (size is stored in parent)
+    node.num_keys = 0;
     node.next = PACK_LINK(NULL, 0);
     node.prev = NULL;
     
@@ -194,6 +195,7 @@ __mram_ptr InternalNode* create_internal_node(ThreadLocalData *tls) {
 
 static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mram_ptr LeafNode *leaf_addr, LeafNode *leaf_wram, int leaf_current_size, KeyType key, ValueType value, KeyType *split_key, __mram_ptr LeafNode **new_leaf_out, int *new_leaf_size_out, int *old_leaf_new_size_out) {
     LeafNode new_leaf_wram __dma_aligned;
+    memset(&new_leaf_wram, 0, sizeof(LeafNode));
     __mram_ptr LeafNode *new_leaf_addr = create_leaf_node(tls);
     int total_keys = leaf_current_size + 1;
     int split_val = total_keys / 2;
@@ -248,6 +250,8 @@ static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mr
     
     int old_leaf_new_size = split_val;
     int new_leaf_size = right_count;
+    leaf_wram->num_keys = old_leaf_new_size;
+    new_leaf_wram.num_keys = new_leaf_size;
     
     leaf_wram->next = PACK_LINK(new_leaf_addr, new_leaf_size);
     
@@ -264,40 +268,6 @@ static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mr
     *new_leaf_out = new_leaf_addr;
     *new_leaf_size_out = new_leaf_size;
     *old_leaf_new_size_out = old_leaf_new_size;
-    
-    // Verify correctness before writing
-    int verify_old_ok = 1, verify_new_ok = 1;
-    for (int i = 0; i < old_leaf_new_size - 1; i++) {
-        if (leaf_wram->keys[i] >= leaf_wram->keys[i+1]) {
-            verify_old_ok = 0;
-            break;
-        }
-    }
-    for (int i = 0; i < new_leaf_size - 1; i++) {
-        if (new_leaf_wram.keys[i] >= new_leaf_wram.keys[i+1]) {
-            verify_new_ok = 0;
-            break;
-        }
-    }
-    
-    if (!verify_old_ok) {
-        printf("ERROR: split_leaf_node created unsorted old leaf! old_size=%d, pos=%d, key=%d\n",
-               old_leaf_new_size, pos, key);
-        printf("  Old leaf keys: ");
-        for (int i = 0; i < old_leaf_new_size; i++) printf("%d ", leaf_wram->keys[i]);
-        printf("\n");
-    }
-    if (!verify_new_ok) {
-        printf("ERROR: split_leaf_node created unsorted new leaf! new_size=%d, pos=%d, key=%d\n",
-               new_leaf_size, pos, key);
-        printf("  Original leaf_current_size=%d, total_keys=%d, split_val=%d\n", 
-               leaf_current_size, total_keys, split_val);
-        printf("  Original leaf: ");
-        for (int i = 0; i < leaf_current_size; i++) printf("%d ", leaf_wram->keys[i]);
-        printf("\n  New leaf keys: ");
-        for (int i = 0; i < new_leaf_size; i++) printf("%d ", new_leaf_wram.keys[i]);
-        printf("\n");
-    }
     
     mram_write(&new_leaf_wram, new_leaf_addr, sizeof(LeafNode));
     mram_write(leaf_wram, leaf_addr, sizeof(LeafNode));
@@ -415,7 +385,9 @@ bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* roo
     if (*root_ptr == NULL) {
         __mram_ptr LeafNode *root = create_leaf_node(tls);
         LeafNode root_wram __dma_aligned;
+        memset(&root_wram, 0, sizeof(LeafNode));
         root_wram.type = LEAF_NODE;
+        root_wram.num_keys = 1;
         root_wram.keys[0] = key;
         root_wram.values[0] = value;
         root_wram.next = PACK_LINK(NULL, 0);
@@ -468,17 +440,21 @@ bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* roo
     }
 
     // The optimization above reads only valid keys/values.
-    // However, LeafNode stores 'next' and 'prev' pointers at the VERY END of the struct (offset 244/248).
+    // However, LeafNode stores 'next' and 'prev' pointers at the VERY END of the struct (offset 248/252).
     // If we only read partial data, 'next' and 'prev' in wram contain garbage.
     // When we later mram_write the full node, we corrupt the linked list in MRAM.
     // MUST read the full leaf node here to ensure next/prev are loaded.
     mram_read(curr, &tls->node_buf, sizeof(LeafNode));
 
     LeafNode *leaf = &tls->node_buf.leaf;
+    if (leaf->num_keys >= 0 && leaf->num_keys <= MAX_KEYS) {
+        curr_size = leaf->num_keys;
+    }
     // If key exists, update    
     for(int i=0; i<curr_size; i++) {
         if (leaf->keys[i] == key) {
             leaf->values[i] = value;
+            leaf->num_keys = curr_size;
             mram_write(leaf, curr, sizeof(LeafNode));
             return false;
         }
@@ -494,7 +470,7 @@ bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* roo
         }
         leaf->keys[pos] = key;
         leaf->values[pos] = value;
-        // leaf->num_keys++; REMOVED
+        leaf->num_keys = curr_size + 1;
         
         mram_write(leaf, curr, sizeof(LeafNode));
         
@@ -786,37 +762,9 @@ void connect_leaf_list(Subtree left, Subtree right) {
     if (l_info.addr && r_info.addr) {
         LeafNode l_node;
         mram_read(l_info.addr, &l_node, sizeof(LeafNode));
-        
-        // Verify left leaf is sorted before connecting
-        int l_ok = 1;
-        for (int i = 0; i < l_info.size - 1; i++) {
-            if (l_node.keys[i] >= l_node.keys[i+1]) {
-                l_ok = 0;
-                printf("  connect_leaf_list WARNING: Left leaf unsorted at pos %d: %d >= %d\n",
-                       i, l_node.keys[i], l_node.keys[i+1]);
-                break;
-            }
-        }
-        
-        // Verify right leaf is sorted before connecting
+
         LeafNode r_node;
         mram_read(r_info.addr, &r_node, sizeof(LeafNode));
-        
-        int r_ok = 1;
-        for (int i = 0; i < r_info.size - 1; i++) {
-            if (r_node.keys[i] >= r_node.keys[i+1]) {
-                r_ok = 0;
-                printf("  connect_leaf_list WARNING: Right leaf unsorted at pos %d: %d >= %d\n",
-                       i, r_node.keys[i], r_node.keys[i+1]);
-                break;
-            }
-        }
-        
-        // Verify proper ordering across leaves
-        if (l_ok && r_ok && l_node.keys[l_info.size - 1] > r_node.keys[0]) {
-            printf("  connect_leaf_list WARNING: Left max=%d > Right min=%d (ORDER VIOLATION!)\n",
-                   l_node.keys[l_info.size - 1], r_node.keys[0]);
-        }
         
         // Link left -> right
         l_node.next = PACK_LINK(r_info.addr, r_info.size);
@@ -914,11 +862,33 @@ static uint32_t count_tree_keys(__mram_ptr void* root, int root_size, int height
         h--;
     }
     
-    // Count keys: note that num_keys field was removed from LeafNode
-    // Size of each leaf is encoded in its next pointer (7 LSBs)
-    // Simply count leaves and estimate, or return the nr_queries value
-    // For now, return number of queries as the expected count
-    return (uint32_t)nr_queries;
+    // Count keys by traversing leaf chain using explicit leaf occupancy.
+    uint32_t total_keys = 0;
+    uint32_t leaf_count = 0;
+    __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr;
+    
+    while (leaf_addr != NULL && leaf_count < 50000) {
+        LeafNode leaf;
+        mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+        
+        leaf_count++;
+        
+        int leaf_keys = leaf.num_keys;
+        if (leaf_keys < 0 || leaf_keys > MAX_KEYS) {
+            leaf_keys = MAX_KEYS;
+        }
+        total_keys += (uint32_t)leaf_keys;
+        
+        // Move to next leaf
+        NodeLink next_link = leaf.next;
+        if (next_link == 0) {
+            leaf_addr = NULL;
+        } else {
+            leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
+        }
+    }
+    
+    return total_keys;
 }
 
 // Test 2动作2: 在发现违反后进行就地冒泡排序修复
@@ -1449,36 +1419,6 @@ Subtree merge_same_height(int thread_id, Subtree t_left, Subtree t_right) {
     root.keys[0] = t_right.min_key;
     root.children[1] = PACK_LINK(t_right.root, t_right.root_size);
     
-    // DEBUG: If both are leaves (height==1), verify they are properly ordered before writing
-    if (t_left.height == 1) {
-        LeafNode left_leaf, right_leaf;
-        mram_read((__mram_ptr LeafNode*)t_left.root, &left_leaf, sizeof(LeafNode));
-        mram_read((__mram_ptr LeafNode*)t_right.root, &right_leaf, sizeof(LeafNode));
-        
-        int left_ok = 1, right_ok = 1;
-        for (int i = 0; i < t_left.root_size - 1; i++) {
-            if (left_leaf.keys[i] >= left_leaf.keys[i+1]) {
-                left_ok = 0;
-                printf("  merge_same_height: LEFT LEAF UNSORTED at pos %d: %d >= %d\n",
-                       i, left_leaf.keys[i], left_leaf.keys[i+1]);
-                break;
-            }
-        }
-        for (int i = 0; i < t_right.root_size - 1; i++) {
-            if (right_leaf.keys[i] >= right_leaf.keys[i+1]) {
-                right_ok = 0;
-                printf("  merge_same_height: RIGHT LEAF UNSORTED at pos %d: %d >= %d\n",
-                       i, right_leaf.keys[i], right_leaf.keys[i+1]);
-                break;
-            }
-        }
-        
-        if (left_ok && right_ok && left_leaf.keys[t_left.root_size - 1] > right_leaf.keys[0]) {
-            printf("  merge_same_height: BETWEEN-LEAF ORDER VIOLATION: left_max=%d > right_min=%d\n",
-                   left_leaf.keys[t_left.root_size - 1], right_leaf.keys[0]);
-        }
-    }
-    
     mram_write(&root, new_root, sizeof(InternalNode));
     
     Subtree res;
@@ -1577,14 +1517,156 @@ void insert_and_propagate(int thread_id,
     }
 }
 
+// Descend along a fixed boundary (leftmost/rightmost) until target height.
+static int descend_boundary_path(__mram_ptr void* root, int root_size, int root_h,
+                                 int target_h, bool go_right,
+                                 __mram_ptr void** path, int* path_sizes, int* child_indices) {
+    __mram_ptr void* curr = root;
+    int curr_size = root_size;
+    int curr_h = root_h;
+    int depth = 0;
+
+    while (curr_h > target_h) {
+        path[depth] = curr;
+        path_sizes[depth] = curr_size;
+
+        int idx = go_right ? curr_size : 0;
+        child_indices[depth] = idx;
+
+        InternalNode node;
+        mram_read(curr, &node, sizeof(InternalNode));
+        NodeLink child = node.children[idx];
+        curr = UNPACK_ADDR(child);
+        curr_size = UNPACK_SIZE(child);
+        curr_h--;
+        depth++;
+    }
+
+    path[depth] = curr;
+    path_sizes[depth] = curr_size;
+    return depth;
+}
+
 Subtree merge_left_shorter(int thread_id, Subtree t_left, Subtree t_right) {
-    // NOT USED - merge algorithm simplified based on disjoint key ranges
-    return t_right;
+    // A=t_left (shorter, all keys smaller), B=t_right (taller)
+    Subtree base = t_right;
+    KeyType old_base_min = base.min_key;
+
+    __mram_ptr void* path[MAX_BPTREE_HEIGHT];
+    int path_sizes[MAX_BPTREE_HEIGHT];
+    int child_indices[MAX_BPTREE_HEIGHT];
+
+    if (t_left.height > 1) {
+        // Discard shorter root logically: insert its child subtrees into B's left boundary.
+        InternalNode short_root;
+        mram_read(t_left.root, &short_root, sizeof(InternalNode));
+        int k = t_left.root_size;
+
+        // Insert c1..ck with separators short_root.keys[0..k-1].
+        for (int i = 1; i <= k; i++) {
+            int depth = descend_boundary_path(base.root, base.root_size, base.height,
+                                              t_left.height, false,
+                                              path, path_sizes, child_indices);
+
+            insert_and_propagate(thread_id,
+                                 path, path_sizes, child_indices, depth,
+                                 short_root.keys[i - 1], short_root.children[i],
+                                 &base);
+        }
+
+        // Insert separator for old leftmost subtree and then replace leftmost child by c0.
+        int depth = descend_boundary_path(base.root, base.root_size, base.height,
+                                          t_left.height, false,
+                                          path, path_sizes, child_indices);
+
+        InternalNode target;
+        __mram_ptr void* target_node = path[depth];
+        mram_read(target_node, &target, sizeof(InternalNode));
+        NodeLink old_leftmost = target.children[0];
+
+        insert_and_propagate(thread_id,
+                             path, path_sizes, child_indices, depth,
+                             old_base_min, old_leftmost,
+                             &base);
+
+        depth = descend_boundary_path(base.root, base.root_size, base.height,
+                                      t_left.height, false,
+                                      path, path_sizes, child_indices);
+        target_node = path[depth];
+        mram_read(target_node, &target, sizeof(InternalNode));
+        target.children[0] = short_root.children[0];
+        mram_write(&target, target_node, sizeof(InternalNode));
+    } else {
+        // Shorter tree is a leaf: prepend single leaf on the left boundary.
+        int depth = descend_boundary_path(base.root, base.root_size, base.height,
+                                          2, false,
+                                          path, path_sizes, child_indices);
+
+        InternalNode target;
+        __mram_ptr void* target_node = path[depth];
+        mram_read(target_node, &target, sizeof(InternalNode));
+        NodeLink old_leftmost = target.children[0];
+
+        insert_and_propagate(thread_id,
+                             path, path_sizes, child_indices, depth,
+                             old_base_min, old_leftmost,
+                             &base);
+
+        depth = descend_boundary_path(base.root, base.root_size, base.height,
+                                      2, false,
+                                      path, path_sizes, child_indices);
+        target_node = path[depth];
+        mram_read(target_node, &target, sizeof(InternalNode));
+        target.children[0] = PACK_LINK(t_left.root, t_left.root_size);
+        mram_write(&target, target_node, sizeof(InternalNode));
+    }
+
+    base.min_key = t_left.min_key;
+    return base;
 }
 
 Subtree merge_right_shorter(int thread_id, Subtree t_left, Subtree t_right) {
-    // NOT USED - merge algorithm simplified based on disjoint key ranges  
-    return t_left;
+    // A=t_right (shorter, all keys larger), B=t_left (taller)
+    Subtree base = t_left;
+
+    __mram_ptr void* path[MAX_BPTREE_HEIGHT];
+    int path_sizes[MAX_BPTREE_HEIGHT];
+    int child_indices[MAX_BPTREE_HEIGHT];
+
+    if (t_right.height > 1) {
+        // Discard shorter root logically: append its children on B's right boundary.
+        InternalNode short_root;
+        mram_read(t_right.root, &short_root, sizeof(InternalNode));
+        int k = t_right.root_size;
+
+        for (int i = 0; i <= k; i++) {
+            KeyType sep = (i == 0) ? t_right.min_key : short_root.keys[i - 1];
+            NodeLink child_link = short_root.children[i];
+
+            int depth = descend_boundary_path(base.root, base.root_size, base.height,
+                                              t_right.height, true,
+                                              path, path_sizes, child_indices);
+
+            insert_and_propagate(thread_id,
+                                 path, path_sizes, child_indices, depth,
+                                 sep, child_link,
+                                 &base);
+        }
+    } else {
+        // Shorter tree is a leaf: append single leaf on the right boundary.
+        int depth = descend_boundary_path(base.root, base.root_size, base.height,
+                                          2, true,
+                                          path, path_sizes, child_indices);
+
+        insert_and_propagate(thread_id,
+                             path, path_sizes, child_indices, depth,
+                             t_right.min_key,
+                             PACK_LINK(t_right.root, t_right.root_size),
+                             &base);
+    }
+
+    base.max_key = t_right.max_key;
+    return base;
 }
 
 // Direct serial merge: combine 16 thread-local trees by creating new root
@@ -1593,9 +1675,11 @@ void serial_merge_all(int thread_id) {
     
     // Collect the final merged tree from each thread
     Subtree thread_trees[NR_TASKLETS];
+    int non_empty_threads = 0;
     for (int i = 0; i < NR_TASKLETS; i++) {
         if (forest_count[i] > 0) {
             forest_read(i, 0, &thread_trees[i]);
+            non_empty_threads++;
         } else {
             memset(&thread_trees[i], 0, sizeof(Subtree));
         }
@@ -1637,9 +1721,9 @@ void serial_merge_all(int thread_id) {
 }
 
 Subtree merge_two_trees(int thread_id, Subtree t_left, Subtree t_right) {
-    // 0. Connect Leaf Lists
+    // Global invariant: ranges are disjoint and ordered left->right.
     connect_leaf_list(t_left, t_right);
-    
+
     if (t_left.height == t_right.height) {
         return merge_same_height(thread_id, t_left, t_right);
     } else if (t_left.height < t_right.height) {
@@ -1657,9 +1741,6 @@ void parallel_merge_local(int thread_id) {
     forest_read(thread_id, 0, &merged);
     for (int j = 1; j < count; j++) {
         forest_read(thread_id, j, &next);
-        
-        printf("[Thread %d] Merging subtree %d with %d (heights: %d + %d, sizes: %d + %d)\n",
-               thread_id, 0, j, merged.height, next.height, merged.root_size, next.root_size);
         
         merged = merge_two_trees(thread_id, merged, next);
     }
@@ -1720,11 +1801,12 @@ int main()
             mram_read(&query_buffer[i], local_queries, count * sizeof(kvpair_t));
             
             for (int j = 0; j < count; j++) {
-                bptree_insert_thread(thread_id, &global_root, &global_root_size_var, local_queries[j].key, local_queries[j].value);
+                bptree_insert_thread(thread_id, &global_root, &global_root_size_var,
+                                     local_queries[j].key, local_queries[j].value);
             }
         }
         
-        // Calculate Split Keys, traverse the leaves to find split points
+        // Calculate Split Keys by uniform distribution across leaf nodes
         int leaf_count = 0;
         __mram_ptr void* curr = global_root;
         // Go to leftmost leaf node
@@ -1734,7 +1816,7 @@ int main()
             if (n.internal.type == LEAF_NODE) break;
             curr = UNPACK_ADDR(n.internal.children[0]);
         }
-        // calculate total leaf nodes
+        // Calculate total leaf nodes
         __mram_ptr LeafNode* first_leaf = (__mram_ptr LeafNode*)curr;
         __mram_ptr LeafNode* l = first_leaf;
         while(l) {
@@ -1744,8 +1826,9 @@ int main()
             l = UNPACK_ADDR(ln.next);
         }
         
-        split_keys[0] = 0;  // Keys are non-negative (rand() >= 0)
-        split_keys[NR_TASKLETS] = INT32_MAX;
+        // Initialize split_keys using uniform leaf distribution
+        split_keys[0] = 0;  // Start from 0 (key range is [0, 2^31-1])
+        split_keys[NR_TASKLETS] = INT32_MAX;  // End at INT32_MAX
         for(int i=1; i<NR_TASKLETS; i++) split_keys[i] = INT32_MAX;
         
         if (leaf_count > 0) {
@@ -1760,14 +1843,17 @@ int main()
                 LeafNode ln;
                 mram_read(l, &ln, sizeof(LeafNode));
                 
-                if (current_leaf_idx == target_idx) {
-                    if (UNPACK_ADDR(ln.next)) {
-                        LeafNode next_ln;
-                        // read next leaf
-                        mram_read(UNPACK_ADDR(ln.next), &next_ln, sizeof(LeafNode));
-                        // 1st key as the split key
-                        split_keys[split_idx] = next_ln.keys[0];
+                if (current_leaf_idx == target_idx && split_idx < NR_TASKLETS) {
+                    // Use the first key of this leaf as the split point
+                    // This ensures each thread starts from where previous thread's leaves end
+                    int first_key = 0;
+                    for (int i = 0; i < MAX_KEYS; i++) {
+                        if (ln.keys[i] != 0) {
+                            first_key = ln.keys[i];
+                            break;
+                        }
                     }
+                    split_keys[split_idx] = first_key;
                     split_idx++;
                 }
                 l = UNPACK_ADDR(ln.next);
@@ -1956,8 +2042,34 @@ int main()
                     lcache.valid = true;
                 }
             } else {
-                // Key doesn't fit any existing subtree - create new one
-                if (my_forest_count < MAX_SUBTREES) {
+                // Key doesn't fit any existing subtree - try to insert into current or create new
+                // First try to insert into current tree even if key is outside min_key range (flexible range)
+                if (cursor < my_forest_count) {
+                    RootSplitInfo split_info;
+                    bptree_insert_thread_ex(thread_id, &cur_subtree.root, &cur_subtree.root_size, key, value, &split_info);
+                    forest_write(thread_id, cursor, &cur_subtree);
+                    
+                    // Handle split if needed
+                    if (split_info.did_split && my_forest_count < MAX_SUBTREES) {
+                        KeyType old_max = cur_subtree.max_key;
+                        cur_subtree.max_key = split_info.split_key;
+                        forest_write(thread_id, cursor, &cur_subtree);
+                        
+                        Subtree new_sub;
+                        new_sub.root = split_info.new_root;
+                        new_sub.root_size = split_info.new_root_size;
+                        new_sub.min_key = split_info.split_key;
+                        new_sub.max_key = old_max;
+                        new_sub.height = cur_subtree.height;
+                        new_sub._pad = 0;
+                        
+                        insert_subtree_sorted_mram(thread_id, &new_sub, cursor, my_forest_count);
+                        my_forest_count = forest_count[thread_id];
+                        forest_read(thread_id, cursor, &cur_subtree);
+                    }
+                    lcache.valid = false;
+                } else if (my_forest_count < MAX_SUBTREES) {
+                    // Create new subtree for this key
                     Subtree new_sub;
                     new_sub.root = NULL;
                     new_sub.root_size = 0;
@@ -1966,24 +2078,23 @@ int main()
                     new_sub.height = 1;
                     new_sub._pad = 0;
                     
-                    int pos = (cursor < my_forest_count) ? cursor : my_forest_count;
-                    // Insert at pos in MRAM (shift right)
-                    Subtree tmp;
-                    for (int k = my_forest_count; k > pos; k--) {
-                        forest_read(thread_id, k - 1, &tmp);
-                        forest_write(thread_id, k, &tmp);
-                    }
-                    forest_write(thread_id, pos, &new_sub);
+                    forest_write(thread_id, my_forest_count, &new_sub);
                     forest_count[thread_id]++;
                     my_forest_count = forest_count[thread_id];
-                    cursor = pos;
+                    cursor = my_forest_count - 1;
                     
-                    // Read it into cur_subtree for bptree_insert_thread
                     forest_read(thread_id, cursor, &cur_subtree);
                     bptree_insert_thread(thread_id, &cur_subtree.root, &cur_subtree.root_size, key, value);
                     forest_write(thread_id, cursor, &cur_subtree);
                     lcache.valid = false;
-                    cache_misses++;
+                } else {
+                    // Forest full - still try to insert into last tree (merge overflow)
+                    RootSplitInfo split_info;
+                    if (cursor >= my_forest_count) cursor = my_forest_count - 1;
+                    forest_read(thread_id, cursor, &cur_subtree);
+                    bptree_insert_thread_ex(thread_id, &cur_subtree.root, &cur_subtree.root_size, key, value, &split_info);
+                    forest_write(thread_id, cursor, &cur_subtree);
+                    lcache.valid = false;
                 }
             }
         }
