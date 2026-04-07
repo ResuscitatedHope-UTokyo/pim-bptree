@@ -11,35 +11,14 @@ export UPMEM_HOME
 export PATH="$UPMEM_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$UPMEM_HOME/lib:${LD_LIBRARY_PATH:-}"
 
-OUTPUT_FILE="${1:-$REPO_ROOT/logs/$(date +%Y%m%d%H%M%S).txt}"
-if [[ $# -gt 0 ]]; then
-    shift
-fi
-
-TASKLETS=()
-if [[ $# -eq 0 ]]; then
-    TASKLETS=(1 2 4 8 16)
-else
-    for arg in "$@"; do
-        arg="${arg//,/ }"
-        for t in $arg; do
-            if ! [[ "$t" =~ ^[0-9]+$ ]]; then
-                echo "Invalid tasklet value: $t"
-                echo "Usage: $0 [output_file] [tasklet1 tasklet2 ...]"
-                echo "Example: $0 ../logs/my_report.txt 1 2 4 8 16"
-                exit 1
-            fi
-            TASKLETS+=("$t")
-        done
-    done
-fi
-
-if [[ "${#TASKLETS[@]}" -eq 0 ]]; then
-    echo "No tasklet value provided."
-    echo "Usage: $0 [output_file] [tasklet1 tasklet2 ...]"
-    echo "Example: $0 ../logs/my_report.txt 1 2 4 8 16"
+if [[ $# -gt 1 ]]; then
+    echo "Usage: $0 [output_file]"
+    echo "This script runs with fixed NR_TASKLETS: 1 2 4 8 16"
     exit 1
 fi
+
+OUTPUT_FILE="${1:-$REPO_ROOT/logs/$(date +%Y%m%d%H%M%S).txt}"
+TASKLETS=(1 2 4 8 16)
 
 mkdir -p "$(dirname "$OUTPUT_FILE")"
 
