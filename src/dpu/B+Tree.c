@@ -1056,6 +1056,12 @@ static void verify_leaf_occupancy(__mram_ptr void* root, int root_size, int heig
     leaf_occupancy_verification.max_occupancy_leaves = 0;
     leaf_occupancy_verification.first_violation_leaf_size = 0;
     leaf_occupancy_verification.root_leaf_checked = 0;
+
+    uint32_t leaf_size_hist[MAX_KEYS + 1];
+    uint32_t invalid_leaf_size_count = 0;
+    for (int i = 0; i <= MAX_KEYS; i++) {
+        leaf_size_hist[i] = 0;
+    }
     
     // In B+ tree with MAX_KEYS=30 (order m=31):
     // - Leaf nodes can have at most 30 keys
@@ -1090,40 +1096,19 @@ static void verify_leaf_occupancy(__mram_ptr void* root, int root_size, int heig
     int leaf_index = 0;
     int violations_shown = 0;
     const int MAX_VIOLATIONS_SHOWN = 10;
-    int prev_leaf_size = 0;  // Track size of previous leaf from its next link
-    
     while (leaf_addr != NULL) {
         LeafNode leaf;
         mram_read(leaf_addr, &leaf, sizeof(LeafNode));
-        
-        // For the first leaf, use curr_size which was set from navigation
-        // For subsequent leaves, use the size stored in the PREVIOUS leaf's next link
-        int leaf_size;
-        if (leaf_index == 0) {
-            leaf_size = curr_size;
+
+        int leaf_size = leaf.num_keys;
+        if (leaf_size >= 0 && leaf_size <= MAX_KEYS) {
+            leaf_size_hist[leaf_size]++;
         } else {
-            leaf_size = prev_leaf_size;
+            invalid_leaf_size_count++;
         }
-        
-        // For the last leaf, we need to count keys since next will be NULL
-        // Extract the next link to check if this is the last leaf
+
         NodeLink next_link = leaf.next;
         __mram_ptr LeafNode* next_leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
-        
-        if (next_leaf_addr == NULL) {
-            // This is the last leaf - count actual keys
-            // Count non-zero keys to determine actual occupancy
-            int actual_keys = 0;
-            for (int i = 0; i < MAX_KEYS; i++) {
-                if (leaf.keys[i] != 0) {
-                    actual_keys++;
-                }
-            }
-            leaf_size = actual_keys;
-        } else {
-            // Store size for next iteration
-            prev_leaf_size = UNPACK_SIZE(next_link);
-        }
         
         leaf_occupancy_verification.total_leaves_checked++;
         
@@ -1163,6 +1148,16 @@ static void verify_leaf_occupancy(__mram_ptr void* root, int root_size, int heig
     printf("Total leaves checked: %u\n", leaf_occupancy_verification.total_leaves_checked);
     printf("Underfull leaves (< min): %u\n", leaf_occupancy_verification.min_occupancy_leaves);
     printf("Overfull leaves (> max): %u\n", leaf_occupancy_verification.max_occupancy_leaves);
+
+    printf("Leaf occupancy histogram (keys per leaf):\n");
+    for (int keys = 0; keys <= MAX_KEYS; keys++) {
+        if (leaf_size_hist[keys] > 0) {
+            printf("  %2d keys: %u\n", keys, leaf_size_hist[keys]);
+        }
+    }
+    if (invalid_leaf_size_count > 0) {
+        printf("  invalid keys: %u\n", invalid_leaf_size_count);
+    }
     
     if (leaf_occupancy_verification.min_occupancy_leaves == 0 && 
         leaf_occupancy_verification.max_occupancy_leaves == 0) {
