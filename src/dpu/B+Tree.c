@@ -60,7 +60,8 @@ typedef uint32_t NodeLink;
 
 struct __dma_aligned LeafNode {
     NodeType type; // 4
-    int num_keys; // 4 (explicit leaf occupancy)
+    // TODO: recover the Occupancy Embedding
+    int num_keys; // 4
     KeyType keys[MAX_KEYS]; // 4 * 30 = 120
     ValueType values[MAX_KEYS]; // 4 * 30 = 120
     NodeLink next; // 4 (Embedded size of next leaf)
@@ -112,6 +113,7 @@ static void forest_write(int thread_id, int idx, const Subtree *in) {
     mram_write(in, &subtrees_mram[thread_id * MAX_SUBTREES + idx], sizeof(Subtree));
 }
 
+// Banned
 // Leaf cache for fast-path sorted-key insertion
 typedef struct {
     __mram_ptr void* leaf_ptr;     // cached leaf address
@@ -173,6 +175,7 @@ __mram_ptr LeafNode* create_leaf_node(ThreadLocalData *tls) {
     LeafNode node __dma_aligned;
     memset(&node, 0, sizeof(LeafNode));
     node.type = LEAF_NODE;
+    // TODO
     node.num_keys = 0;
     node.next = PACK_LINK(NULL, 0);
     node.prev = NULL;
@@ -254,6 +257,15 @@ static void __attribute__((noinline)) split_leaf_node(ThreadLocalData *tls, __mr
     new_leaf_wram.num_keys = new_leaf_size;
     
     leaf_wram->next = PACK_LINK(new_leaf_addr, new_leaf_size);
+
+    // Keep predecessor leaf's embedded next-size in sync with left split result.
+    __mram_ptr LeafNode* prev_leaf_addr = leaf_wram->prev;
+    if (prev_leaf_addr != NULL) {
+        LeafNode prev_leaf __dma_aligned;
+        mram_read(prev_leaf_addr, &prev_leaf, sizeof(LeafNode));
+        prev_leaf.next = PACK_LINK(leaf_addr, old_leaf_new_size);
+        mram_write(&prev_leaf, prev_leaf_addr, sizeof(LeafNode));
+    }
     
     __mram_ptr LeafNode* next_leaf_addr = UNPACK_ADDR(new_leaf_wram.next);
 
@@ -411,7 +423,7 @@ bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* roo
     // Calculate exact transfer size based on occupancy.
     // Layout: Header(4) + Keys(120) + Children/Values...
     // Both Internal and Leaf start Children/Values at offset 124.
-    // We strictly need up to 124 + (size + 1) * 4 bytes to cover:
+    // Strictly need up to 124 + (size + 1) * 4 bytes to cover:
     // - Internal: size keys, size+1 children
     // - Leaf: size keys, size values
     // Align to 8 bytes for DMA interaction.
@@ -470,12 +482,20 @@ bool bptree_insert_thread_ex(int thread_id, __mram_ptr void** root_ptr, int* roo
         }
         leaf->keys[pos] = key;
         leaf->values[pos] = value;
-        leaf->num_keys = curr_size + 1;
+        int new_size = curr_size + 1;
+        leaf->num_keys = new_size;
         
         mram_write(leaf, curr, sizeof(LeafNode));
+
+        // Keep predecessor leaf's embedded next-size consistent.
+        if (leaf->prev != NULL) {
+            LeafNode prev_leaf __dma_aligned;
+            mram_read(leaf->prev, &prev_leaf, sizeof(LeafNode));
+            prev_leaf.next = PACK_LINK(curr, new_size);
+            mram_write(&prev_leaf, leaf->prev, sizeof(LeafNode));
+        }
         
         // Propagate size update up to parent
-        int new_size = curr_size + 1;
         if (depth > 0) {
             __mram_ptr void* parent_ptr = path[depth-1];
             int parent_idx = child_indices[depth-1];
@@ -765,9 +785,16 @@ void connect_leaf_list(Subtree left, Subtree right) {
 
         LeafNode r_node;
         mram_read(r_info.addr, &r_node, sizeof(LeafNode));
+
+        int right_size = r_node.num_keys;
+        if (right_size < 0 || right_size > MAX_KEYS) {
+            right_size = r_info.size;
+            if (right_size < 0) right_size = 0;
+            if (right_size > MAX_KEYS) right_size = MAX_KEYS;
+        }
         
         // Link left -> right
-        l_node.next = PACK_LINK(r_info.addr, r_info.size);
+        l_node.next = PACK_LINK(r_info.addr, right_size);
         mram_write(&l_node, l_info.addr, sizeof(LeafNode));
         
         // Link right -> prev = left
@@ -891,7 +918,7 @@ static uint32_t count_tree_keys(__mram_ptr void* root, int root_size, int height
     return total_keys;
 }
 
-// Test 2动作2: 在发现违反后进行就地冒泡排序修复
+// Test 2
 static void repair_leaf_ordering(__mram_ptr void* root, int root_size, int height) {
     if (root == NULL) {
         return;
@@ -913,11 +940,19 @@ static void repair_leaf_ordering(__mram_ptr void* root, int root_size, int heigh
     uint32_t repaired_count = 0;
     
     __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr;
-    int leaf_size = curr_size;
+    int leaf_size_from_link = curr_size;
     
     while (leaf_addr != NULL) {
         LeafNode leaf;
         mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+
+        int leaf_size = leaf.num_keys;
+        if (leaf_size < 0 || leaf_size > MAX_KEYS) {
+            leaf_size = leaf_size_from_link;
+            if (leaf_size < 0 || leaf_size > MAX_KEYS) {
+                leaf_size = MAX_KEYS;
+            }
+        }
         
         // Simple bubble sort for this leaf
         bool swapped = true;
@@ -944,7 +979,7 @@ static void repair_leaf_ordering(__mram_ptr void* root, int root_size, int heigh
         // Move to next leaf
         NodeLink next_link = leaf.next;
         leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
-        leaf_size = UNPACK_SIZE(next_link);
+        leaf_size_from_link = UNPACK_SIZE(next_link);
     }
     
     if (repaired_count > 0) {
@@ -1302,13 +1337,28 @@ static void verify_leaf_ordering(__mram_ptr void* root, int root_size, int heigh
     const int DEBUG_MAX_VIOLATIONS = 20;
     
     __mram_ptr LeafNode* leaf_addr = (__mram_ptr LeafNode*)curr;
-    int leaf_size = curr_size;
+    int leaf_size_from_link = curr_size;
     
     printf("\n========== TEST 2: LEAF ORDERING VERIFICATION ==========\n");
     
     while (leaf_addr != NULL) {
         LeafNode leaf;
         mram_read(leaf_addr, &leaf, sizeof(LeafNode));
+
+        int leaf_size = leaf.num_keys;
+        if (leaf_size < 0 || leaf_size > MAX_KEYS) {
+            leaf_size = leaf_size_from_link;
+            if (leaf_size < 0 || leaf_size > MAX_KEYS) {
+                leaf_size = MAX_KEYS;
+            }
+        }
+        if (leaf_size <= 0) {
+            NodeLink next_link = leaf.next;
+            leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
+            leaf_size_from_link = UNPACK_SIZE(next_link);
+            leaf_index++;
+            continue;
+        }
         
         int leaf_min_key = leaf.keys[0];
         int leaf_max_key = leaf.keys[leaf_size - 1];
@@ -1353,7 +1403,7 @@ static void verify_leaf_ordering(__mram_ptr void* root, int root_size, int heigh
         // Move to next leaf
         NodeLink next_link = leaf.next;
         leaf_addr = (__mram_ptr LeafNode*)UNPACK_ADDR(next_link);
-        leaf_size = UNPACK_SIZE(next_link);
+        leaf_size_from_link = UNPACK_SIZE(next_link);
     }
     
     printf("Total leaves traversed: %u\n", leaf_index);
